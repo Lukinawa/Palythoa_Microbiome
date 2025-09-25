@@ -1,0 +1,1484 @@
+##################################################
+############## TAXONOMY ASSIGNMENT ###############
+##################################################
+
+# R VERSION: 4.5.0
+# LUKAS PIRKNER
+# 10/08/2025
+
+
+# 1 ── libraries
+library(dada2)
+library(Biostrings)
+library(readr)
+library(phyloseq)
+library(ggplot2)
+library(scales)
+library(microbiome)
+library(decontam)
+library(dplyr)
+library(tidyr)
+library(ranacapa) #(rarefaction plots)
+
+objnames <- load("~/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis_09_08_2025.RData")
+objnames
+sapply(objnames, function(n) class(get(n)))
+
+
+# --- Helper: infer marker label (returns "16S" / "ITS2" / default) ---
+infer_marker <- function(ps_obj, path = NULL, default = "16S") {
+  # 1) try sample_data columns
+  if (inherits(ps_obj, "phyloseq")) {
+    sd <- as.data.frame(sample_data(ps_obj))
+    for (col in c("marker", "Marker", "mk")) {
+      if (col %in% names(sd)) {
+        u <- unique(na.omit(as.character(sd[[col]])))
+        if (length(u) == 1L && nzchar(u)) return(u)
+      }
+    }
+  }
+  # 2) try the file path name
+  if (!is.null(path)) {
+    b <- basename(path)
+    m <- regmatches(b, regexpr("(16S|ITS2)", b, ignore.case = TRUE))
+    if (length(m) && nzchar(m)) return(toupper(m))
+  }
+  # 3) fallback
+  default
+}
+
+
+# 2 ── folders (use your existing globals)
+dir_out   <- file.path(base_dir, "4.results")
+refdb_dir <- file.path(base_dir, "5.refdb")
+
+# 3 ── reference files (adjust filenames to what you actually have)
+ref16S_train    <- file.path(refdb_dir, "silva_nr99_v138.1_train_set.fa.gz")
+ref16S_species  <- file.path(refdb_dir, "silva_species_assignment_v138.1.fa.gz")
+refITS2_train   <- file.path(refdb_dir, "unite_its2_train.fa.gz")       # example
+refITS2_species <- file.path(refdb_dir, "unite_its2_species.fa.gz")     # optional
+
+
+
+assign_marker_tax <- function(mk,
+                              ref_train    = NULL,
+                              ref_species  = NULL,
+                              min_length   = 50) {
+  # Default reference paths based on marker
+  if (is.null(ref_train)) {
+    if (mk == "16S") {
+      ref_train   <- file.path(refdb_dir, "silva_nr99_v138.1_train_set.fa.gz")
+      ref_species <- file.path(refdb_dir, "silva_species_assignment_v138.1.fa.gz")
+    } else if (mk == "ITS2") {
+      ref_train   <- file.path(refdb_dir, "unite_its2_train.fa.gz")
+      ref_species <- file.path(refdb_dir, "unite_its2_species.fa.gz")
+    } else {
+      stop("Unknown marker: ", mk)
+    }
+  }
+  
+  # File checks
+  fasta_file <- file.path(dir_out, paste0("asvs_", mk, ".fasta"))
+  count_file <- file.path(dir_out, paste0("count_table_", mk, ".txt"))
+  if (!file.exists(fasta_file)) stop("Missing FASTA for ", mk, ": ", fasta_file)
+  if (!file.exists(count_file)) stop("Missing count table for ", mk, ": ", count_file)
+  if (!file.exists(ref_train))  stop("Missing reference for ", mk, ": ", ref_train)
+  
+  # Read FASTA
+  asv_set  <- Biostrings::readDNAStringSet(fasta_file)
+  asv_seqs <- as.character(asv_set)
+  names(asv_seqs) <- names(asv_set)   # ASV IDs
+  
+  # Filter out short sequences if needed
+  if (!is.null(min_length) && min_length > 0) {
+    keep <- nchar(asv_seqs) >= min_length
+    if (any(!keep)) {
+      message(sprintf("[%s] Filtering out %d ASVs shorter than %d nt",
+                      mk, sum(!keep), min_length))
+    }
+    asv_seqs <- asv_seqs[keep]
+  }
+  
+  # Read count table
+  count_tab <- readr::read_tsv(count_file, show_col_types = FALSE)
+  stopifnot("SampleID" %in% colnames(count_tab))
+  asv_ids <- colnames(count_tab)[-1]
+  count_mat <- as.matrix(count_tab[, -1])
+  rownames(count_mat) <- count_tab$SampleID
+  colnames(count_mat) <- asv_ids
+  seqtab.nochim <- count_mat
+  
+  # Align ASVs between count table and FASTA
+  colnames(seqtab.nochim) <- trimws(colnames(seqtab.nochim))
+  names(asv_seqs)         <- trimws(names(asv_seqs))
+  shared_asvs <- intersect(colnames(seqtab.nochim), names(asv_seqs))
+  seqtab.nochim <- seqtab.nochim[, shared_asvs, drop = FALSE]
+  asv_seqs      <- asv_seqs[shared_asvs]
+  message(sprintf("[%s] ASVs in both FASTA and table: %d", mk, length(shared_asvs)))
+  
+  # Assign taxonomy
+  tax <- dada2::assignTaxonomy(seqs = asv_seqs, refFasta = ref_train,
+                               multithread = TRUE, tryRC = TRUE)
+  if (!is.null(ref_species) && file.exists(ref_species)) {
+    tax <- dada2::addSpecies(tax, refFasta = ref_species, allowMultiple = TRUE)
+  }
+  
+  # Map taxonomy rows (sequence strings) -> ASV IDs
+  seq_to_id <- setNames(names(asv_seqs), asv_seqs)
+  rownames(tax) <- seq_to_id[rownames(tax)]
+  
+  # Align taxonomy rows with OTU columns
+  keep <- intersect(colnames(seqtab.nochim), rownames(tax))
+  seqtab.nochim <- seqtab.nochim[, keep, drop = FALSE]
+  tax <- tax[keep, , drop = FALSE]
+  
+  # Build phyloseq object
+  otu <- phyloseq::otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+  tax_tab <- phyloseq::tax_table(as.matrix(tax))
+  ps <- phyloseq::phyloseq(otu, tax_tab)
+  
+  # Save outputs
+  saveRDS(seqtab.nochim, file.path(dir_out, paste0("seqtab_nochim_", mk, ".rds")))
+  saveRDS(tax,           file.path(dir_out, paste0("taxa_", mk, ".rds")))
+  
+  # Return
+  invisible(list(seqtab = seqtab.nochim, taxa = tax, ps = ps))
+}
+
+
+# 5 ── run per marker
+res16S  <- assign_marker_tax("16S",  ref16S_train,  ref16S_species)
+#resITS2 <- assign_marker_tax("ITS2", refITS2_train, refITS2_species) #-commented out ITS2-#
+
+
+
+#######################################################
+##############     DECONTAMINATION (per marker)  ######
+#######################################################
+
+library(phyloseq)
+library(decontam)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+
+dir_out <- file.path(base_dir, "4.results")
+fig_dir <- file.path(dir_out, "figures")
+dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Helper: build ps for a marker from objects returned earlier OR from saved RDS
+build_ps <- function(mk, res = NULL) {
+  if (!is.null(res)) {
+    seqtab.nochim <- res$seqtab                 # samples × ASVs
+    taxa          <- res$taxa                   # ASVs × ranks (matrix/data.frame)
+  } else {
+    seqtab.nochim <- readRDS(file.path(dir_out, paste0("seqtab_nochim_", mk, ".rds")))
+    taxa          <- readRDS(file.path(dir_out, paste0("taxa_", mk, ".rds")))
+  }
+  otu <- phyloseq::otu_table(seqtab.nochim, taxa_are_rows = FALSE)
+  tax <- phyloseq::tax_table(as.matrix(taxa))
+  phyloseq(otu, tax)
+}
+
+# If you kept results from the taxonomy step:
+# ps_16S  <- build_ps("16S",  res16S)
+# ps_ITS2 <- build_ps("ITS2", resITS2)
+# Otherwise, this will load from the RDS files:
+ps_16S  <- build_ps("16S")
+#ps_ITS2 <- build_ps("ITS2") #### commented out ######
+
+run_decontam_and_plots <- function(ps, mk) {
+  # 1) Auto metadata (NC detection by sample name)
+  sids <- sample_names(ps)
+  meta <- data.frame(
+    SampleID   = sids,
+    SampleType = ifelse(grepl("NC", sids, ignore.case = TRUE), "NC", "Sample"),
+    row.names  = sids
+  )
+  sample_data(ps) <- sample_data(meta)
+  sample_data(ps)$is_neg <- sample_data(ps)$SampleType == "NC"
+  
+  # 2) decontam (prevalence)
+  contam_results <- isContaminant(ps, method = "prevalence", neg = "is_neg")
+  
+  # --- NEW: summarize contaminant counts (ASVs) and save ---
+  n_total_asv   <- nrow(contam_results)
+  n_contam_asv  <- sum(contam_results$contaminant)
+  n_keep_asv    <- n_total_asv - n_contam_asv
+  pct_contam_asv <- if (n_total_asv == 0) 0 else 100 * n_contam_asv / n_total_asv
+  
+  message(sprintf("[%s] Contaminant ASVs: %d / %d (%.1f%%); kept: %d",
+                  mk, n_contam_asv, n_total_asv, pct_contam_asv, n_keep_asv))
+  
+  # Save a quick text summary + the list of contaminant ASVs
+  summary_path <- file.path(dir_out, paste0("contaminant_summary_", mk, ".txt"))
+  writeLines(
+    c(
+      paste0("Marker: ", mk),
+      paste0("Total ASVs: ", n_total_asv),
+      paste0("Contaminant ASVs: ", n_contam_asv, " (", sprintf("%.1f", pct_contam_asv), "%)"),
+      paste0("Kept ASVs: ", n_keep_asv)
+    ),
+    summary_path
+  )
+  
+  # Also save IDs of contaminants (and kept) for transparency
+  contam_ids_path <- file.path(dir_out, paste0("contaminant_ASV_ids_", mk, ".txt"))
+  kept_ids_path   <- file.path(dir_out, paste0("kept_ASV_ids_", mk, ".txt"))
+  writeLines(rownames(contam_results)[contam_results$contaminant], contam_ids_path)
+  writeLines(rownames(contam_results)[!contam_results$contaminant], kept_ids_path)
+  
+  
+  # 3) Filter out contaminants
+  ps_clean <- prune_taxa(!contam_results$contaminant, ps)
+  
+  # 4) Save cleaned phyloseq
+  saveRDS(ps_clean, file = file.path(dir_out, paste0("phyloseq_cleaned_no_contaminants_", mk, ".rds")))
+  
+  # 5) Quick NC composition plot
+  p_nc <- plot_bar(subset_samples(ps, SampleType == "NC"), fill = "Phylum") +
+    theme_minimal() + labs(title = paste0("Negative Controls – Phylum (", mk, ")"))
+  ggsave(file.path(fig_dir, paste0("NC_phylum_", mk, ".png")), p_nc, width = 8, height = 5, dpi = 300, bg = "white")
+  
+  # 6) Contaminant summaries
+  taxa_df <- as.data.frame(tax_table(ps))
+  contam_asvs   <- rownames(taxa_df)[contam_results$contaminant]
+  contam_tax    <- taxa_df[contam_asvs, , drop = FALSE]
+  contam_tax$ASV <- rownames(contam_tax)
+  contam_tax$Phylum[is.na(contam_tax$Phylum)] <- "Unknown"
+  contam_tax$Genus[is.na(contam_tax$Genus)]   <- "Unknown"
+  
+  # Save contaminant table
+  write.table(contam_tax,
+              file = file.path(dir_out, paste0("contaminants_", mk, ".txt")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  # 7) Contaminant phylum bar (counts of ASVs)
+  contam_phylum_counts <- as.data.frame(table(contam_tax$Phylum))
+  colnames(contam_phylum_counts) <- c("Phylum", "Count")
+  p_contam_phylum <- ggplot(contam_phylum_counts, aes(x = reorder(Phylum, -Count), y = Count)) +
+    geom_bar(stat = "identity") +
+    theme_minimal() + labs(title = paste0("Contaminant ASVs by Phylum (", mk, ")"),
+                           x = "Phylum", y = "Number of ASVs") +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+  ggsave(file.path(fig_dir, paste0("contaminant_phyla_", mk, ".png")),
+         p_contam_phylum, width = 8, height = 5, dpi = 300, bg = "white")
+  
+  # 8) Contaminant-only phyloseq + relative abundance
+  ps_contam     <- prune_taxa(contam_results$contaminant, ps)
+  ps_contam_rel <- transform_sample_counts(ps_contam, function(x) if (sum(x) == 0) x else x / sum(x))
+  ps_contam_rel <- prune_samples(sample_sums(ps_contam_rel) > 0, ps_contam_rel)
+  sample_data(ps_contam_rel)$SampleID <- sample_names(ps_contam_rel)
+  
+  # 9) Total read count per contaminant genus (absolute)
+  otu <- as(otu_table(ps_contam), "matrix")
+  if (taxa_are_rows(ps_contam)) otu <- t(otu)
+  otu <- as.data.frame(otu)
+  otu$SampleID <- rownames(otu)
+  
+  otu_long <- tidyr::pivot_longer(otu, -SampleID, names_to = "ASV", values_to = "Abundance")
+  tax_c    <- as.data.frame(tax_table(ps_contam)); tax_c$ASV <- rownames(tax_c)
+  
+  merged <- left_join(otu_long, tax_c, by = "ASV")
+  merged$Genus[is.na(merged$Genus)] <- "Unknown"
+  
+  genus_summary <- merged %>%
+    group_by(Genus) %>%
+    summarise(TotalAbundance = sum(Abundance), .groups = "drop") %>%
+    arrange(desc(TotalAbundance))
+  write.table(genus_summary,
+              file = file.path(dir_out, paste0("contaminant_genus_totals_", mk, ".txt")),
+              sep = "\t", quote = FALSE, row.names = FALSE)
+  
+  p_genus_abs <- ggplot(genus_summary, aes(x = reorder(Genus, TotalAbundance), y = TotalAbundance)) +
+    geom_bar(stat = "identity") +
+    coord_flip() + theme_minimal(base_size = 12) +
+    labs(title = paste0("Total Read Count of Contaminant Genera (", mk, ")"),
+         x = "Genus", y = "Total Read Count")
+  ggsave(file.path(fig_dir, paste0("contaminant_genus_totals_", mk, ".png")),
+         p_genus_abs, width = 7, height = 7, dpi = 300, bg = "white")
+  
+  # 10) Percentage of total reads (relative to FULL dataset ps)
+  total_reads_all <- sum(otu_table(ps))
+  genus_pct <- genus_summary %>%
+    mutate(Percentage = if (total_reads_all == 0) 0 else 100 * TotalAbundance / total_reads_all)
+  
+  p_genus_pct <- ggplot(genus_pct, aes(x = reorder(Genus, Percentage), y = Percentage)) +
+    geom_bar(stat = "identity") +
+    coord_flip() + theme_minimal(base_size = 12) +
+    labs(title = paste0("Contaminant Genera as % of Total Reads (", mk, ")"),
+         x = "Genus", y = "Percentage of Total Reads (%)")
+  ggsave(file.path(fig_dir, paste0("contaminant_genus_percentage_", mk, ".png")),
+         p_genus_pct, width = 7, height = 7, dpi = 300, bg = "white")
+  
+  
+  # 11) Bubble plot (contaminants)
+  otu_raw <- as(otu_table(ps_contam), "matrix")
+  otu_rel <- as(otu_table(ps_contam_rel), "matrix")
+  if (taxa_are_rows(ps_contam)) {
+    otu_raw <- t(otu_raw); otu_rel <- t(otu_rel)
+  }
+  df_raw <- as.data.frame(otu_raw); df_raw$Sample <- rownames(df_raw)
+  df_rel <- as.data.frame(otu_rel); df_rel$Sample <- rownames(df_rel)
+  
+  long_raw <- pivot_longer(df_raw, -Sample, names_to = "ASV", values_to = "RawCount")
+  long_rel <- pivot_longer(df_rel, -Sample, names_to = "ASV", values_to = "RelAbundance")
+  long_combined <- left_join(long_raw, long_rel, by = c("Sample", "ASV"))
+  
+  # Order samples: NC first
+  sample_levels <- c(sort(grep("NC", unique(long_combined$Sample), value = TRUE)),
+                     sort(setdiff(unique(long_combined$Sample),
+                                  grep("NC", unique(long_combined$Sample), value = TRUE))))
+  long_combined$Sample <- factor(long_combined$Sample, levels = sample_levels)
+  
+  tax_df <- as.data.frame(tax_table(ps_contam)); tax_df$ASV <- rownames(tax_df)
+  long_combined <- left_join(long_combined, tax_df, by = "ASV")
+  long_combined$Genus[is.na(long_combined$Genus)] <- "Unknown"
+  
+  p_bubble <- ggplot(long_combined, aes(x = Sample, y = Genus)) +
+    geom_point(aes(size = RawCount, color = RelAbundance), alpha = 0.9) +
+    scale_size_continuous(name = "Raw Read Count", range = c(1, 10)) +
+    scale_color_gradient(name = "Relative Abundance", low = "#ffb3ba", high = "#b30000") +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste0("Contaminant ASVs – Bubble Plot (", mk, ")"),
+         x = "Sample", y = "Genus")
+  ggsave(file.path(fig_dir, paste0("contaminant_bubble_", mk, ".png")),
+         p_bubble, width = 10, height = 7, dpi = 300, bg = "white")
+  
+  
+  ################################################################
+  ###           MITOCHONDRIA/CHLOROPLAST CLEANUP              ###  
+  ###############################################################
+  
+  
+  ## ── Host/organelle & non-bacterial cleanup (run once before plotting) ──
+  tt <- as.data.frame(tax_table(ps_clean), stringsAsFactors = FALSE)
+  
+  `%||%` <- function(x, y) if (is.null(x)) y else x  # tiny helper
+  
+  is_non_bac <- !grepl("^Bacteria$", tt$Kingdom %||% "", ignore.case = TRUE)
+  # Catch "Chloroplast" anywhere in the lineage (some DBs put it in Class/Order)
+  is_chloro  <- grepl("Chloroplast", do.call(paste, c(tt, sep = ";")), ignore.case = TRUE)
+  # Mitochondria is usually reported at Family
+  is_mito    <- grepl("Mitochondria", tt$Family %||% "", ignore.case = TRUE)
+  
+  keep_core  <- !(is_non_bac | is_chloro | is_mito)
+  ps_nohost  <- prune_taxa(keep_core, ps_clean)
+  
+  message(sprintf("Removed (non-bacterial/chloroplast/mitochondria): %d ASVs (kept %d)",
+                  sum(!keep_core), sum(keep_core)))
+  
+  # Sanity check: should be zero
+  rem_check <- sum(grepl("Mitochondria", tax_table(ps_nohost)[,"Family"] %||% "", ignore.case = TRUE)) +
+    sum(grepl("Chloroplast", do.call(paste, c(as.data.frame(tax_table(ps_nohost)), sep=";")),
+              ignore.case = TRUE))
+  message("Organelle ASVs remaining after prune: ", rem_check)
+  
+  ## ── OPTIONAL sensitivity: also drop Cutibacterium (document if you use it) ──
+  drop_genera <- c("Cutibacterium")
+  tt2 <- as.data.frame(tax_table(ps_nohost), stringsAsFactors = FALSE)
+  drop_genus_flag <- tt2$Genus %in% drop_genera
+  ps_nohost_nocuti <- prune_taxa(!drop_genus_flag, ps_nohost)
+  message(sprintf("Optional: dropped %d ASVs in %s",
+                  sum(drop_genus_flag), paste(drop_genera, collapse = ", ")))
+  
+  ################################################################
+  ###                        END                              ###  
+  ###############################################################
+  
+  
+  # 12) Phylum-level relative abundance (CLEANED, samples only)
+  ps_final <- subset_samples(ps_clean, SampleType != "NC")
+  ps_rel   <- transform_sample_counts(ps_final, function(x) if (sum(x) == 0) x else x / sum(x))
+  
+  ps_rel_collapsed <- microbiome::aggregate_rare(
+    ps_rel, level = "Phylum", detection = 0.01, prevalence = 0.01
+  )
+  
+  df <- psmelt(ps_rel_collapsed)
+  df$Phylum <- as.character(df$Phylum)
+  df$Phylum[is.na(df$Phylum)] <- "Unknown"
+  
+  my_colors <- c(
+    "Proteobacteria"    = "#471323",
+    "Spirochaetota"     = "#7F96FF",
+    "Verrucomicrobiota" = "#BCBD22",
+    "Cyanobacteria"     = "#FF7518",
+    "Planctomycetota"   = "#6A43C7",
+    "Bdellovibrionota"  = "#82FFC7",
+    "Chloroflexi"       = "#FFC49B",
+    "Actinobacteriota"  = "#515A47",
+    "Bacteroidota"      = "#FB607F",
+    "Acidobacteriota"   = "#F1ECCE",
+    "Myxococcota"       = "#65DEF1",
+    "Firmicutes"        = "#F4C430",
+    "NB1-j"             = "#73A6AD",
+    "Other"             = "#B5A1E3",
+    "Nitrospirota"      = "#EBADE6",
+    "Fibrobacterota"    = "#7F5643",
+    "Unknown"           = "#9FAEB1"
+  )
+  
+  # Order phyla by total abundance (bottom = most abundant)
+  phylum_order <- df %>%
+    group_by(Phylum) %>%
+    summarise(total = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+    arrange(total) %>% pull(Phylum)
+  df$Phylum <- factor(df$Phylum, levels = phylum_order)
+  
+  p_phylum <- ggplot(df, aes(x = Sample, y = Abundance, fill = Phylum)) +
+    geom_bar(stat = "identity", color = "black", linewidth = 0.1, width = 0.85) +
+    scale_fill_manual(values = my_colors, drop = FALSE) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(title = paste0("Phylum-level Relative Abundance (≥1%) – ", mk),
+         x = "Sample", y = "Relative Abundance (%)", fill = "Phylum")
+  ggsave(file.path(fig_dir, paste0("phylum_relative_", mk, ".png")),
+         p_phylum, width = 11, height = 6, dpi = 300, bg = "white")
+  
+  print(p_phylum)
+  
+################################################################
+###         ORDER SAMPLES BY NORTH AND SOUTH                 ###  
+################################################################
+  
+  # --- reorder samples: North → South (then by read depth within each group) ---
+  sd_plot <- data.frame(sample_data(ps_rel_collapsed))
+  group_col <- if ("Zone" %in% names(sd_plot)) "Zone" else "region"
+  
+  # prefer North, then South; otherwise alphabetical
+  grp_vals <- as.character(sd_plot[[group_col]])
+  group_levels <- intersect(c("North","South"), unique(grp_vals))
+  if (length(group_levels) == 0) group_levels <- sort(unique(grp_vals))
+  
+  # (optional) sort by reads within each group to make bars tidy
+  reads <- sample_sums(ps_rel_collapsed)
+  sd_plot$reads <- reads[rownames(sd_plot)]
+  
+  sd_plot <- sd_plot[order(factor(sd_plot[[group_col]], levels = group_levels),
+                           -sd_plot$reads), , drop = FALSE]
+  sample_order <- rownames(sd_plot)
+  
+  # map this order into the plotting data
+  df$SampleID <- factor(df$Sample, levels = sample_order)
+  
+  phylum_order <- df %>%
+    group_by(Phylum) %>%
+    summarise(total = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+    arrange(total) %>% pull(Phylum)
+  df$Phylum <- factor(df$Phylum, levels = phylum_order)
+  
+  p_phylum <- ggplot(df, aes(x = SampleID, y = Abundance, fill = Phylum)) +
+    geom_bar(stat = "identity", color = "black", linewidth = 0.1, width = 0.85) +
+    scale_fill_manual(values = my_colors, drop = FALSE) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_minimal(base_size = 12) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    labs(#title = paste0("Phylum-level Relative Abundance (≥1%) – ", mk),
+         x = "Sample", y = "Relative Abundance (%)", fill = "Phylum")
+  
+  ggsave(file.path(fig_dir, paste0("phylum_relative_", mk, ".png")),
+         p_phylum, width = 11, height = 6, dpi = 300, bg = "white")
+  
+print(p_phylum)
+  
+  ###############################################################################
+
+
+#install.packages("ggtext")  # run once if you don't have it
+
+suppressPackageStartupMessages(library(ggtext))
+
+## 1) Reorder samples: North → South (then by reads within group)
+sd_plot <- data.frame(sample_data(ps_rel_collapsed))
+group_col <- if ("Zone" %in% names(sd_plot)) "Zone" else "region"
+
+reads <- sample_sums(ps_rel_collapsed)
+sd_plot$reads <- reads[rownames(sd_plot)]
+
+grp_vals <- as.character(sd_plot[[group_col]])
+group_levels <- intersect(c("North", "South"), unique(grp_vals))
+if (length(group_levels) == 0) group_levels <- sort(unique(grp_vals))
+
+sd_plot <- sd_plot[order(factor(sd_plot[[group_col]], levels = group_levels),
+                         -sd_plot$reads), , drop = FALSE]
+sample_order <- rownames(sd_plot)
+
+# Map this order into plotting data
+df$SampleID <- factor(df$Sample, levels = sample_order)
+
+## 2) Color the x-axis labels by Zone (robust mapping)
+user_colors <- c(North = "#7F96FF", South = "#FF7518")
+
+# sample -> zone lookup
+zone_by_sample <- setNames(as.character(sd_plot[[group_col]]), rownames(sd_plot))
+
+# zones for the x-axis levels (character, not factor)
+lvl <- as.character(levels(df$SampleID))
+zones_for_levels <- unname(zone_by_sample[lvl])
+
+# map zones to colors (fallback = dark gray)
+label_colors <- user_colors[zones_for_levels]
+label_colors[is.na(label_colors)] <- "#333333"
+
+# named vector: level -> HTML label
+label_map <- setNames(
+  paste0("<span style='color:", label_colors, "'>", lvl, "</span>"),
+  lvl
+)
+
+# Legend in the x-axis title with a second line "Samples" in black
+legend_x <- sprintf(
+  "<span style='color:#000; font-weight:400;'>Samples</span><br>
+   <span style='color:%s'><b>North</b></span> &nbsp;&bull;&nbsp; 
+   <span style='color:%s'><b>South</b></span>",
+  user_colors["North"], user_colors["South"]
+)
+
+
+## 3) Your original phylum order (unchanged)
+phylum_order <- df %>%
+  dplyr::group_by(Phylum) %>%
+  dplyr::summarise(total = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  dplyr::arrange(total) %>% dplyr::pull(Phylum)
+df$Phylum <- factor(df$Phylum, levels = phylum_order)
+
+p_phylum <- ggplot(df, aes(x = SampleID, y = Abundance, fill = Phylum)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.1, width = 0.85) +
+  scale_fill_manual(values = my_colors, drop = FALSE) +
+  scale_x_discrete(breaks = levels(df$SampleID), labels = label_map) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x   = ggtext::element_markdown(angle = 45, hjust = 1),
+    axis.title.x  = ggtext::element_markdown(margin = margin(t = 8), lineheight = 1.1),
+    plot.title.position = "plot"
+  ) +
+  labs(
+    #title = paste0("Phylum-level Relative Abundance (≥1%) – ", mk),
+    x     = legend_x,   # legend + "Samples" on next line
+    y     = "Relative Abundance (%)",
+    fill  = "Phylum"
+  )
+
+print(p_phylum)
+
+# ---- where to save ----
+fig_dir <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/4.results/figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+out_file <- file.path(fig_dir, paste0("phylum_relative_", mk, ".png"))
+
+# Use ragg if available (better text rendering with ggtext)
+dev_fun <- if (requireNamespace("ragg", quietly = TRUE)) ragg::agg_png else "png"
+
+ggsave(filename = out_file,
+       plot     = p_phylum,
+       width    = 11, height = 6, dpi = 300, bg = "white",
+       device   = dev_fun)
+
+message("Saved to: ", normalizePath(out_file, mustWork = FALSE))
+
+
+
+
+
+################################################################
+###            FAMILY & GENUS plots (parent-tinted)         ###
+################################################################
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(ggtext); library(microbiome)
+})
+
+# tint a color toward white
+mix_col <- function(col, bg = "#FFFFFF", p = 0.5) {
+  c1 <- col2rgb(col)/255; c2 <- col2rgb(bg)/255
+  m  <- (1 - p) * c1 + p * c2
+  rgb(m[1], m[2], m[3])
+}
+
+plot_tax_level_tinted <- function(ps_clean,
+                                  level = "Family",
+                                  detection = 0.01, prevalence = 0.10,
+                                  mk = "16S",
+                                  fig_dir,
+                                  sample_order, label_map, legend_x,
+                                  base_phylum_cols = my_colors,   # your Phylum palette
+                                  hide_legend = (level == "Genus")) {
+  
+  lvl <- as.character(level)[1]
+  
+  # 1) Samples only + relative abundances
+  ps_final <- subset_samples(ps_clean, SampleType != "NC")
+  ps_rel2  <- transform_sample_counts(ps_final, function(x) if (sum(x) == 0) x else x / sum(x))
+  
+  # 2) Make Unknown explicit at target rank & Phylum (and canonicalize Phylum names)
+  tt <- as.data.frame(tax_table(ps_rel2), stringsAsFactors = FALSE)
+  if (!lvl %in% names(tt)) stop("Taxonomy level '", lvl, "' not found in tax_table().")
+  tt$Phylum[is.na(tt$Phylum)] <- "Unknown"
+  tt[[lvl]][is.na(tt[[lvl]])] <- "Unknown"
+  # collapse SILVA variants like Firmicutes_A → Firmicutes for coloring
+  tt$PhylumCanon <- sub("_.*$", "", tt$Phylum)
+  tax_table(ps_rel2) <- tax_table(as.matrix(tt))
+  
+  # 3) Collapse rare taxa at that level with your thresholds
+  ps_coll <- microbiome::aggregate_rare(ps_rel2, level = lvl,
+                                        detection = detection, prevalence = prevalence)
+  
+  # (sanity) stacks should sum ~1
+  s <- sample_sums(ps_coll)
+  if (any(abs(s - 1) > 1e-6)) message("Note: per-sample sums deviate slightly from 1 (rounding).")
+  
+  # 4) Melt for plotting
+  dfL <- psmelt(ps_coll)
+  dfL[[lvl]] <- as.character(dfL[[lvl]]); dfL[[lvl]][is.na(dfL[[lvl]])] <- "Unknown"
+  
+  # Parent phylum (canonical) for each Family/Genus from pre-collapsed taxonomy
+  tax2 <- as.data.frame(tax_table(ps_rel2), stringsAsFactors = FALSE)
+  parent_list <- tapply(tax2$PhylumCanon, tax2[[lvl]],
+                        function(x) { ux <- unique(na.omit(as.character(x))); if (length(ux)) ux[1] else "Unknown" },
+                        simplify = FALSE)
+  parent_vec <- vapply(parent_list, identity, character(1))
+  dfL$ParentPhylum <- parent_vec[dfL[[lvl]]]
+  
+  # 5) Order taxa within legend: block by Phylum, kids by total abundance
+  totals <- dfL %>%
+    group_by(ParentPhylum, .data[[lvl]]) %>%
+    summarise(total = sum(Abundance, na.rm = TRUE), .groups = "drop")
+  
+  # Ensure base palette has entries for all canonical phyla we see
+  ph_seen <- sort(unique(na.omit(totals$ParentPhylum)))
+  ph_core <- setdiff(ph_seen, c("Unknown","Other"))
+  missing <- setdiff(ph_core, names(base_phylum_cols))
+  if (length(missing)) {
+    add_cols <- setNames(scales::hue_pal()(length(missing)), missing)
+    message("Adding colors for missing phyla: ", paste(missing, collapse = ", "))
+    base_phylum_cols <- c(base_phylum_cols, add_cols)
+  }
+  
+  ph_order <- intersect(names(base_phylum_cols), ph_seen)
+  
+  level_order <- unlist(lapply(ph_order, function(ph){
+    totals %>%
+      filter(ParentPhylum == ph) %>%
+      arrange(desc(total)) %>%
+      pull(.data[[lvl]])
+  }), use.names = FALSE)
+  # Append anything not caught, keeping Other/Unknown last
+  rest <- setdiff(unique(dfL[[lvl]]), level_order)
+  level_order <- unique(c(level_order, setdiff(rest, c("Other","Unknown")), c("Other","Unknown")))
+  dfL[[lvl]] <- factor(dfL[[lvl]], levels = level_order)
+  
+  # 6) Build a single fill palette: tint by parent phylum
+  taxa_levels <- levels(dfL[[lvl]])
+  pal <- setNames(rep(NA_character_, length(taxa_levels)), taxa_levels)
+  pal["Other"]   <- "#B5A1E3"
+  pal["Unknown"] <- "#9FAEB1"
+  core <- setdiff(taxa_levels, c("Other","Unknown"))
+  for (ph in ph_order) {
+    kids <- totals %>% filter(ParentPhylum == ph, .data[[lvl]] %in% core) %>%
+      arrange(desc(total)) %>% pull(.data[[lvl]])
+    if (!length(kids)) next
+    base <- base_phylum_cols[[ph]]; if (is.null(base) || is.na(base)) base <- "#808080"
+    n <- length(kids)
+    shades <- if (n == 1) 0.35 else seq(0.25, 0.85, length.out = n)
+    pal[kids] <- vapply(shades, function(pct) mix_col(base, "#FFFFFF", pct), character(1))
+  }
+  
+  # 7) Reuse your North→South order & colored tick labels
+  dfL$SampleID <- factor(dfL$Sample, levels = sample_order)
+  
+  p <- ggplot(dfL, aes(x = SampleID, y = Abundance, fill = .data[[lvl]])) +
+    geom_col(color = "black", linewidth = 0.1, width = 0.85,
+             position = position_stack(reverse = TRUE)) +
+    scale_fill_manual(
+      values = pal, drop = FALSE,
+      guide = if (hide_legend) "none" else guide_legend(ncol = 1, reverse = TRUE)
+      )+
+    scale_x_discrete(breaks = levels(dfL$SampleID), labels = label_map) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    theme_minimal(base_size = 12) +
+    theme(
+      axis.text.x   = ggtext::element_markdown(angle = 45, hjust = 1),
+      axis.title.x  = ggtext::element_markdown(margin = margin(t = 8), lineheight = 1.1),
+      plot.title.position = "plot",
+      legend.position = if (hide_legend) "none" else "right"
+    ) +
+    labs(
+      title = paste0(lvl, "-level Relative Abundance (≥1% / ≥", round(prevalence*100), "% samples) – ", mk),
+      x = legend_x, y = "Relative Abundance (%)", fill = lvl
+    )
+  
+  if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+  outfile <- file.path(fig_dir, paste0(tolower(lvl), "_relative_tinted_", mk, ".png"))
+  ggsave(outfile, p, width = 12, height = if (hide_legend) 6 else 8, dpi = 300, bg = "white",
+         device = if (requireNamespace("ragg", quietly = TRUE)) ragg::agg_png else "png")
+  message("Saved: ", normalizePath(outfile, mustWork = FALSE))
+  p
+}
+
+
+
+p_family <- plot_tax_level_tinted(ps_clean, level = "Family",
+                                  detection = 0.01, prevalence = 0.10,
+                                  mk = mk, fig_dir = fig_dir,
+                                  sample_order = sample_order, label_map = label_map, legend_x = legend_x,
+                                  base_phylum_cols = my_colors, hide_legend = FALSE)
+
+p_genus  <- plot_tax_level_tinted(ps_clean, level = "Genus",
+                                  detection = 0.01, prevalence = 0.05,
+                                  mk = mk, fig_dir = fig_dir,
+                                  sample_order = sample_order, label_map = label_map, legend_x = legend_x,
+                                  base_phylum_cols = my_colors, hide_legend = FALSE)
+
+
+print(p_family); print(p_genus)
+
+# should exist and be the one saved by run_decontam_and_plots()
+ps_clean
+
+# ASVs that decontam marked as contaminants (saved earlier)
+contam_list <- tryCatch(
+  readLines(file.path(dir_out, "contaminant_ASV_ids_16S.txt")),
+  error = function(e) character(0)
+)
+
+# ASVs currently present & classified as Cutibacterium in the *cleaned* object
+tt <- as.data.frame(tax_table(ps_clean), stringsAsFactors = FALSE)
+keep_cuti_ids <- rownames(tt)[tt$Genus %in% c("Cutibacterium")]
+
+# Overlap should be empty if you’re plotting from the cleaned object
+intersect(keep_cuti_ids, contam_list)
+
+
+################################################################
+
+# — Genus resolution *within Spirochaetaceae* for a chosen sample —
+sample_id <- "bis02-16S"
+family_of_interest <- "Spirochaetaceae"
+
+# relative abundances at ASV level (no collapsing)
+ps_rel_genus <- transform_sample_counts(ps_clean, function(x) if (sum(x)==0) x else x/sum(x))
+tt <- as.data.frame(tax_table(ps_rel_genus))
+tt$Genus[is.na(tt$Genus)] <- "Unknown"
+tax_table(ps_rel_genus) <- tax_table(as.matrix(tt))
+
+# subset to the family and compute genus breakdown for that sample
+ps_fam <- subset_taxa(ps_rel_genus, Family == family_of_interest)
+df_g <- psmelt(ps_fam) |>
+  dplyr::filter(Sample == sample_id) |>
+  dplyr::group_by(Genus) |>
+  dplyr::summarise(p = sum(Abundance), .groups="drop") |>
+  dplyr::arrange(dplyr::desc(p))
+df_g
+sum_unknown <- df_g$p[df_g$Genus == "Unknown"] |> sum(na.rm = TRUE)
+cat("\nWithin", family_of_interest, "in", sample_id, 
+    "→ % Unknown at genus:", scales::percent(sum_unknown), "\n")
+
+# show what happens AFTER your 1% / 10% collapse (why it becomes 'Other')
+ps_fam_coll <- microbiome::aggregate_rare(ps_fam, level = "Genus",
+                                          detection = 0.01, prevalence = 0.10)
+psmelt(ps_fam_coll) |>
+  dplyr::filter(Sample == sample_id) |>
+  dplyr::group_by(Genus) |>
+  dplyr::summarise(p = sum(Abundance), .groups="drop") |>
+  dplyr::arrange(dplyr::desc(p))
+
+
+
+
+################################################################
+
+
+
+
+  # 13) Quick console stats
+  message(sprintf("[%s] Reads before: %s | after clean: %s | removed: %.1f%%",
+                  mk,
+                  scales::comma(sum(otu_table(ps))),
+                  scales::comma(sum(otu_table(ps_clean))),
+                  100 * (1 - sum(otu_table(ps_clean)) / max(1, sum(otu_table(ps))))))
+}
+
+# Run for both markers
+run_decontam_and_plots(ps_16S,  "16S")
+#run_decontam_and_plots(ps_ITS2, "ITS2") #### commented out #####
+
+
+# Load the cleaned object saved by run_decontam_and_plots()
+clean_path <- file.path(dir_out, "phyloseq_cleaned_no_contaminants_16S.rds")
+stopifnot(file.exists(clean_path))
+ps_clean <- readRDS(clean_path)
+ps <- ps_clean  # optional alias for downstream code
+
+# NEW: infer the marker label for titles/labels
+mk <- infer_marker(ps_clean, path = clean_path, default = "16S")
+
+message("Using cleaned 16S | nsamples=", nsamples(ps_clean),
+        " ntaxa=", ntaxa(ps_clean), " reads=", sum(otu_table(ps_clean)))
+
+
+##########################################################################
+#################### CONTAMINANTS SUMMARY TABLE ##########################
+##########################################################################
+
+summarize_contaminants <- function(markers = c("16S","ITS2"),
+                                   project_dir = NULL,
+                                   save_outputs = TRUE) {
+  # resolve project_dir safely
+  if (is.null(project_dir)) {
+    if (exists("base_dir", inherits = TRUE)) {
+      project_dir <- get("base_dir", inherits = TRUE)
+    } else {
+      stop("Please supply project_dir=... or define a global base_dir.")
+    }
+  }
+  
+  dir_out <- file.path(project_dir, "4.results")
+  sum_dir <- file.path(dir_out, "figures", "summary")
+  if (save_outputs) dir.create(sum_dir, recursive = TRUE, showWarnings = FALSE)
+  
+  for (mk in markers) {
+    f_asv      <- file.path(dir_out, paste0("contaminants_", mk, ".txt"))
+    f_genus    <- file.path(dir_out, paste0("contaminant_genus_totals_", mk, ".txt"))
+    f_seqtab   <- file.path(dir_out, paste0("seqtab_nochim_", mk, ".rds"))  # pre-decontam
+    f_ps_clean <- file.path(dir_out, paste0("phyloseq_cleaned_no_contaminants_", mk, ".rds"))
+    
+    if (!file.exists(f_asv)) {
+      message("[", mk, "] No contaminants table found at: ", f_asv, "  (skipping)")
+      next
+    }
+    
+    # Read tables (no side effects)
+    ct <- tryCatch(utils::read.delim(f_asv, check.names = FALSE), error = function(e) NULL)
+    gt <- if (file.exists(f_genus)) tryCatch(utils::read.delim(f_genus, check.names = FALSE), error = function(e) NULL) else NULL
+    if (is.null(ct)) { message("[", mk, "] Could not read contaminants table. Skipping."); next }
+    
+    # Counts by ASV / genus
+    n_asvs   <- nrow(ct)
+    genera   <- if ("Genus" %in% names(ct)) ct$Genus else rep(NA_character_, n_asvs)
+    by_genus <- sort(tapply(rep(1, n_asvs), genera, sum), decreasing = TRUE)
+    by_genus[is.na(names(by_genus))] <- NULL
+    
+    # Total contaminant reads (from genus totals export)
+    total_reads_removed <- NA_real_
+    if (!is.null(gt) && all(c("Genus","TotalAbundance") %in% names(gt))) {
+      total_reads_removed <- sum(gt$TotalAbundance, na.rm = TRUE)
+    }
+    
+    # Reads BEFORE decontam (sum of seqtab_nochim_<mk>.rds)
+    reads_before <- NA_real_
+    if (file.exists(f_seqtab)) {
+      st <- readRDS(f_seqtab)
+      if (is.matrix(st) || is.data.frame(st)) reads_before <- sum(st, na.rm = TRUE)
+    }
+    
+    # Reads AFTER decontam (sum of phyloseq_cleaned_no_contaminants_<mk>.rds)
+    reads_after <- NA_real_
+    if (file.exists(f_ps_clean)) {
+      ps_clean <- readRDS(f_ps_clean)
+      reads_after <- sum(phyloseq::otu_table(ps_clean))
+    }
+    
+    # % removed (two ways; prefer removed/before when available)
+    pct_removed <- if (!is.na(reads_before) && !is.na(total_reads_removed) && reads_before > 0) {
+      100 * total_reads_removed / reads_before
+    } else if (!is.na(reads_before) && !is.na(reads_after) && reads_before > 0) {
+      100 * (1 - reads_after / reads_before)
+    } else {
+      NA_real_
+    }
+    
+    # Console summary
+    message(sprintf(
+      "[%s] Contaminant ASVs: %d | Genera: %d | Reads removed: %s%s",
+      mk, n_asvs, length(by_genus),
+      ifelse(is.na(total_reads_removed), "NA", scales::comma(total_reads_removed)),
+      ifelse(is.na(pct_removed), "", sprintf(" (%.1f%%)", pct_removed))
+    ))
+    
+    # Save a compact CSV + optional small plot
+    if (save_outputs) {
+      out_row <- data.frame(
+        Marker               = mk,
+        N_contaminant_ASVs   = n_asvs,
+        N_genera             = length(by_genus),
+        Reads_before         = ifelse(is.na(reads_before), "", reads_before),
+        Reads_after_clean    = ifelse(is.na(reads_after), "", reads_after),
+        Total_reads_removed  = ifelse(is.na(total_reads_removed), "", total_reads_removed),
+        Percent_removed      = ifelse(is.na(pct_removed), "", round(pct_removed, 1)),
+        stringsAsFactors = FALSE
+      )
+      utils::write.table(
+        out_row,
+        file.path(sum_dir, paste0("contaminant_summary_", mk, ".csv")),
+        sep = ",", row.names = FALSE, quote = TRUE
+      )
+      
+      if (!is.null(gt) && nrow(gt)) {
+        top12 <- head(gt[order(-gt$TotalAbundance), ], 12)
+        p <- ggplot2::ggplot(top12, ggplot2::aes(x = stats::reorder(Genus, TotalAbundance), y = TotalAbundance)) +
+          ggplot2::geom_bar(stat = "identity") +
+          ggplot2::coord_flip() +
+          ggplot2::scale_y_continuous(labels = scales::comma) +
+          ggplot2::theme_minimal(base_size = 11) +
+          ggplot2::labs(title = paste0("Top contaminant genera by reads (", mk, ")"),
+                        x = "Genus", y = "Total reads removed")
+        ggplot2::ggsave(file.path(sum_dir, paste0("contaminant_top_genera_reads_", mk, ".png")),
+                        p, width = 7, height = 5, dpi = 300, bg = "white")
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+
+summarize_contaminants(markers = c("16S"), project_dir = base_dir)
+# later:
+# summarize_contaminants(markers = c("16S","ITS2"), project_dir = base_dir)
+
+
+
+##########################################################################
+# ========= Rarefaction curves (UNRAREFIED, ggplot overlay) =============#
+##########################################################################
+
+
+if (!exists("ggrare", mode = "function")) {
+  stop("ggrare() not found. Install & load a package that provides it (e.g. ranacapa).")
+}
+
+marker_label   <- if (exists("m")) m else "MARKER"
+group_col      <- get0("group_col", ifnotfound = "region")  # uses your existing setting
+step_size      <- 1000
+line_alpha     <- 0.6
+line_size      <- 0.7
+facet_by_group <- FALSE   # set TRUE if you want facets later
+
+# ---- colors you can edit ----
+# set to NULL to auto, or map group names to hex colors:
+user_colors <- c(North = "#7F96FF", South = "#FF7518")
+
+sd <- data.frame(sample_data(ps))
+has_group <- group_col %in% names(sd)
+groups <- if (has_group) sort(unique(na.omit(sd[[group_col]]))) else character(0)
+
+sd[[group_col]] <- factor(sd[[group_col]], levels = names(user_colors))
+
+lvls <- levels(sd[[group_col]])
+pal  <- setNames(user_colors[lvls], lvls)
+
+# Fallback for any missing colors (optional)
+if (any(is.na(pal))) {
+  miss <- is.na(pal)
+  pal[miss] <- scales::hue_pal()(sum(miss))
+}
+
+
+
+# build a complete color map for all groups
+if (!is.null(user_colors)) {
+  region_cols <- user_colors[names(user_colors) %in% groups]
+} else if (has_group && "hex_Region" %in% names(sd) && any(!is.na(sd$hex_Region))) {
+  tmp <- dplyr::distinct(sd[, c(group_col, "hex_Region"), drop = FALSE])
+  tmp <- tmp[!is.na(tmp$hex_Region), , drop = FALSE]
+  region_cols <- if (nrow(tmp) > 0) stats::setNames(tmp$hex_Region, tmp[[group_col]]) else NULL
+} else {
+  region_cols <- NULL
+}
+# ensure every group has a color
+if (has_group) {
+  missing <- setdiff(groups, names(region_cols %||% character(0)))
+  if (length(missing)) {
+    add <- stats::setNames(scales::hue_pal()(length(missing)), missing)
+    region_cols <- c(region_cols, add)
+  }
+}
+
+# lock rarefaction depth for this analysis
+locked_depth <- 23500
+depth_candidate <- locked_depth
+
+
+# build plot (one panel, overlay)
+p_raref <- ggrare(ps, step = step_size, color = if (has_group) group_col else NULL, se = FALSE) +
+  labs(x = "Number of sequence reads",
+       y = "Observed ASVs",
+       title = paste0("Rarefaction (", marker_label, ")")) +
+  theme_classic() +
+  geom_vline(xintercept = depth_candidate, linetype = "dashed") +
+  scale_x_continuous(limits = c(0, NA), expand = ggplot2::expansion(mult = 0)) +
+  scale_y_continuous(limits = c(0, NA), expand = ggplot2::expansion(mult = 0)) +
+  guides(color = guide_legend(override.aes = list(alpha = 1, linewidth = 1.2)))
+
+# apply colors and optional facets
+if (has_group && length(region_cols)) {
+  p_raref <- p_raref + scale_color_manual(values = region_cols)
+}
+if (facet_by_group && has_group) {
+  p_raref <- p_raref + facet_wrap(as.formula(paste("~", group_col)), scales = "free_y")
+}
+
+# thinner, semi-transparent lines to reduce overplotting
+p_raref$layers[[1]]$aes_params$alpha <- line_alpha
+p_raref$layers[[1]]$aes_params$linewidth <- line_size
+
+print(p_raref)
+
+# (optional) save
+# dir.create(file.path("4.results","figures","rarefaction"), recursive = TRUE, showWarnings = FALSE)
+# ggsave(file.path("4.results","figures","rarefaction",
+#                  paste0("rarefaction_", marker_label, "_", depth_candidate, ".png")),
+#        p_raref, width = 8, height = 6, dpi = 300)
+# ======================================================================
+
+otu <- as(otu_table(ps), "matrix"); if (taxa_are_rows(ps)) otu <- t(otu)
+S_at <- vegan::rarefy(otu, sample = depth_candidate)  # observed ASVs @ equal reads
+sd$rich_at_depth <- S_at[rownames(sd)]
+
+# Who is the outlier?
+sd[order(-sd$rich_at_depth), c("rich_at_depth", group_col)][1:5, , drop = FALSE]
+
+# Group comparison at equal effort
+aggregate(rich_at_depth ~ . , sd[, c(group_col, "rich_at_depth")], summary)
+
+
+samp <- names(sort(S_at, decreasing = TRUE))[1]   # richest sample
+x <- otu[samp, ]
+pct_singletons  <- sum(x == 1) / length(x[x > 0]) * 100
+pct_doubletons  <- sum(x == 2) / length(x[x > 0]) * 100
+cat(samp, ": singletons%", round(pct_singletons,1),
+    " doubletons%", round(pct_doubletons,1), "\n")
+
+
+reads <- rowSums(otu)
+singletons <- rowSums(otu == 1)
+goods_cov <- 1 - (singletons / reads)
+sd$goods_coverage <- goods_cov[rownames(sd)]
+
+summary(sd$goods_coverage)
+sd[order(sd$goods_coverage), c("goods_coverage", group_col)][1:5, , drop = FALSE]
+
+
+if (!is.null(tax_table(ps))) {
+  tax <- as.data.frame(tax_table(ps))
+  is_chloro <- grepl("Chloroplast", tax$Order %||% "", ignore.case = TRUE)
+  is_mito   <- grepl("Mitochondria", tax$Family %||% "", ignore.case = TRUE)
+  keep_taxa <- !(is_chloro | is_mito)
+  
+  pct_host <- 100 * sample_sums(prune_taxa(!keep_taxa, ps)) / sample_sums(ps)
+  sd$pct_host <- pct_host[rownames(sd)]
+  summary(sd$pct_host)
+  sd[order(-sd$pct_host), c("pct_host", group_col)][1:5, , drop = FALSE]
+}
+
+
+##########################     BOXPLOT      #################################
+ 
+ggplot(sd, aes(x = .data[[group_col]],
+               y = rich_at_depth,
+               color = .data[[group_col]],
+               fill  = .data[[group_col]])) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.2) +   # alpha colors the box fill
+  geom_jitter(width = 0.2, alpha = 0.7) +
+  scale_color_manual(values = pal, guide = "none") + # hide legend; remove if you want it
+  scale_fill_manual(values  = pal, guide = "none") +
+  labs(x = NULL, y = paste0("Observed ASVs at ", depth_candidate, " reads")) +
+  theme_classic()
+
+
+# Pick the right grouping column (yours looks like "Zone")
+group_col <- "Zone"
+
+# 1) prune non-bacterial + organelles (robust to missing ranks)
+tax <- as.data.frame(tax_table(ps))
+is_non_bac <- !grepl("^Bacteria$", tax$Kingdom %||% "", ignore.case = TRUE)
+is_chloro  <- grepl("Chloroplast", do.call(paste, c(tax, sep=";")), ignore.case = TRUE)
+is_mito    <- grepl("Mitochondria", do.call(paste, c(tax, sep=";")), ignore.case = TRUE)
+ps_cleanB  <- prune_taxa(!(is_non_bac | is_chloro | is_mito), ps)
+
+# 2) equal-effort richness at your locked depth
+otuB <- as(otu_table(ps_cleanB), "matrix"); if (taxa_are_rows(ps_cleanB)) otuB <- t(otuB)
+S_atB <- vegan::rarefy(otuB, sample = depth_candidate)
+
+sdB <- data.frame(sample_data(ps_cleanB))
+sdB$rich_at_depth <- S_atB[rownames(sdB)]
+
+# quick per-group summary
+aggregate(rich_at_depth ~ . , sdB[, c(group_col, "rich_at_depth")], summary)
+
+# equal-effort richness at locked depth
+otuB <- as(otu_table(ps_cleanB), "matrix"); if (taxa_are_rows(ps_cleanB)) otuB <- t(otuB)
+S_atB <- vegan::rarefy(otuB, sample = depth_candidate)   # NA for samples < depth
+
+# keep only samples with enough reads for the comparison
+keepB <- rowSums(otuB) >= depth_candidate
+cat("Samples kept/dropped for equal-effort richness:", table(keepB), "\n")
+
+sdB <- data.frame(sample_data(ps_cleanB))
+sdB$rich_at_depth <- S_atB[rownames(sdB)]
+sdB <- sdB[keepB, ]  # drop the NA one(s)
+
+
+# Keep only samples with enough reads for equal-effort comparison
+keepB <- rowSums(otuB) >= depth_candidate
+sdB   <- data.frame(sample_data(ps_cleanB))
+sdB$rich_at_depth <- S_atB[rownames(sdB)]
+sdB   <- sdB[keepB & !is.na(sdB$rich_at_depth), , drop = FALSE]
+
+# Helpful counts
+cat("Kept:", sum(keepB), "Dropped:", sum(!keepB), "\n")
+
+# ---- Wilcoxon test (no tidy pronouns) ----
+# Option 1: build a base-R formula from the column name
+w <- wilcox.test(as.formula(paste("rich_at_depth ~", group_col)),
+                 data = sdB, exact = FALSE)
+print(w)
+
+# Medians per group (at equal effort)
+meds <- tapply(sdB$rich_at_depth, sdB[[group_col]], median, na.rm = TRUE)
+print(meds)
+
+# Sensitivity: drop the single richest sample and retest
+top_id <- rownames(sdB)[which.max(sdB$rich_at_depth)]
+w_no <- wilcox.test(as.formula(paste("rich_at_depth ~", group_col)),
+                    data = sdB[rownames(sdB) != top_id, , drop = FALSE],
+                    exact = FALSE)
+cat("Dropped:", top_id, "\n"); print(w_no)
+
+
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Visualize "Other" and "Unknown" by Zone
+# Requires: ps_rel_collapsed (phylum-level with "Other"), ps_rel (ASV-level), df colors you used before are fine
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(ggplot2); library(ggtext); library(scales)
+})
+
+## 1) Build a tidy frame with Other/Unknown per sample
+df_coll <- psmelt(ps_rel_collapsed)
+df_coll$Phylum <- as.character(df_coll$Phylum)
+df_coll$Phylum[is.na(df_coll$Phylum)] <- "Unknown"
+
+ou <- df_coll %>%
+  dplyr::filter(Phylum %in% c("Other","Unknown")) %>%
+  dplyr::group_by(Sample, Phylum) %>%
+  dplyr::summarise(frac = sum(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::complete(Sample, Phylum = c("Other","Unknown"), fill = list(frac = 0))
+
+## 2) Order samples North → South and color tick labels
+sd_plot <- data.frame(sample_data(ps_rel_collapsed))
+group_col <- if ("Zone" %in% names(sd_plot)) "Zone" else "region"
+
+# prefer North then South; else alphabetical
+grp_vals <- as.character(sd_plot[[group_col]])
+group_levels <- intersect(c("North","South"), unique(grp_vals))
+if (length(group_levels) == 0) group_levels <- sort(unique(grp_vals))
+
+# (optional) order within-group by read depth
+reads <- sample_sums(ps_rel_collapsed)
+sd_plot$reads <- reads[rownames(sd_plot)]
+sd_plot <- sd_plot[order(factor(sd_plot[[group_col]], levels = group_levels),
+                         -sd_plot$reads), , drop = FALSE]
+sample_order <- rownames(sd_plot)
+
+ou$SampleID <- factor(ou$Sample, levels = sample_order)
+ou$Zone     <- sd_plot[[group_col]][match(ou$Sample, rownames(sd_plot))]
+
+# colored tick labels by Zone
+user_colors <- c(North = "#7F96FF", South = "#FF7518")
+zone_by_sample <- setNames(as.character(sd_plot[[group_col]]), rownames(sd_plot))
+lvl <- as.character(levels(ou$SampleID))
+zones_for_levels <- unname(zone_by_sample[lvl])
+label_colors <- user_colors[zones_for_levels]; label_colors[is.na(label_colors)] <- "#333333"
+label_map <- setNames(
+  paste0("<span style='color:", label_colors, "'>", lvl, "</span>"),
+  lvl
+)
+
+# x-axis title with legend under/over as you prefer:
+legend_x <- sprintf(
+  "<span style='color:#000; font-weight:400;'>Samples</span><br>
+   <span style='color:%s'><b>North</b></span> &nbsp;&bull;&nbsp;
+   <span style='color:%s'><b>South</b></span>",
+  user_colors["North"], user_colors["South"]
+)
+
+## 3) Per-sample bars (two bars per sample: Other & Unknown)
+pal_ou <- c(Other = "#9fa86b", Unknown = "#9FAEB1")
+
+p_ou_samples <- ggplot(ou, aes(x = SampleID, y = frac, fill = Phylum)) +
+  geom_col(position = position_dodge(width = 0.85), width = 0.8, color = "black", linewidth = 0.1) +
+  scale_fill_manual(values = pal_ou, drop = FALSE) +
+  scale_x_discrete(breaks = levels(ou$SampleID), labels = label_map) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = ggtext::element_markdown(angle = 45, hjust = 1),
+    axis.title.x = ggtext::element_markdown(margin = margin(t = 8), lineheight = 1.1),
+    plot.title.position = "plot"
+  ) +
+  labs(title = paste0("Fraction of reads in ‘Other’ and ‘Unknown’ (", mk, ")"),
+       x = legend_x, y = "Relative abundance", fill = NULL)
+
+print(p_ou_samples)
+
+## 4) Group summary: boxplots by Zone
+p_ou_box <- ggplot(ou, aes(x = Zone, y = frac, fill = Phylum)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.35) +
+  geom_jitter(width = 0.15, alpha = 0.6, size = 1) +
+  scale_fill_manual(values = pal_ou, drop = FALSE) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme_classic(base_size = 12) +
+  labs(title = paste0("‘Other’ and ‘Unknown’ by Zone (", mk, ")"),
+       x = NULL, y = "Relative abundance", fill = NULL)
+
+print(p_ou_box)
+
+## 5) (Optional) quick tests for each category
+by_zone <- ou |> tidyr::pivot_wider(names_from = Phylum, values_from = frac, values_fill = 0)
+if ("Other" %in% names(by_zone)) {
+  cat("\nWilcoxon (Other South vs North):\n")
+  print(wilcox.test(Other ~ Zone, data = by_zone, exact = FALSE))
+}
+if ("Unknown" %in% names(by_zone)) {
+  cat("\nWilcoxon (Unknown South vs North):\n")
+  print(wilcox.test(Unknown ~ Zone, data = by_zone, exact = FALSE))
+}
+
+## 6) Save
+fig_dir <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/4.results/figures"
+if (!dir.exists(fig_dir)) dir.create(fig_dir, recursive = TRUE)
+dev_fun <- if (requireNamespace("ragg", quietly = TRUE)) ragg::agg_png else "png"
+
+ggsave(file.path(fig_dir, paste0("other_unknown_by_sample_", mk, ".png")),
+       p_ou_samples, width = 12, height = 6, dpi = 300, bg = "white", device = dev_fun)
+ggsave(file.path(fig_dir, paste0("other_unknown_boxplot_", mk, ".png")),
+       p_ou_box, width = 7.5, height = 5.5, dpi = 300, bg = "white", device = dev_fun)
+# ──────────────────────────────────────────────────────────────────────
+
+
+
+suppressPackageStartupMessages({ library(dplyr); library(tidyr); library(ggplot2); library(scales) })
+
+## 0) Inputs
+# ps_rel           = ASV-level relative abundances (no collapse)
+# ps_rel_collapsed = phylum-level collapsed with "Other" (your 1%/1% rule)
+group_col <- if ("Zone" %in% names(data.frame(sample_data(ps_rel)))) "Zone" else "region"
+
+## 1) Get matrices + robust phylum mapping (avoid NA groups)
+tax <- as.data.frame(tax_table(ps_rel))
+M   <- as(otu_table(ps_rel), "matrix")
+if (taxa_are_rows(ps_rel)) M <- t(M)  # rows = samples, cols = ASVs
+# Align taxonomy to ASVs by name and plug Unknown where missing
+idx <- match(colnames(M), rownames(tax))
+phylum_vec <- as.character(tax$Phylum[idx])
+phylum_vec[is.na(phylum_vec)] <- "Unknown"
+
+sd <- data.frame(sample_data(ps_rel))
+sd$..zone.. <- sd[[group_col]]
+
+## 2) Decide which phyla were *kept* in your collapsed object
+df_coll <- psmelt(ps_rel_collapsed)
+phylums_coll <- unique(as.character(df_coll$Phylum))
+kept_phyla   <- setdiff(phylums_coll, c("Other","Unknown"))  # what survived the collapse
+other_phyla  <- setdiff(unique(phylum_vec), c(kept_phyla, "Unknown"))
+
+if (!length(other_phyla)) {
+  stop("Your collapsed object has no 'Other' phyla at the chosen thresholds. 
+       Check unique(df_coll$Phylum). If 'Other' isn’t present there, lower the thresholds or revisit aggregate_rare().")
+}
+
+## 3) Keep only ASVs whose phylum ∈ “Other” (excluding Unknown)
+keep_asv <- phylum_vec %in% other_phyla
+M_other  <- M[, keep_asv, drop = FALSE]
+if (ncol(M_other) == 0) stop("No ASVs map to 'Other' (after alignment).")
+
+## 4) Summarize 'Other' ASVs by Zone
+df_other <- as.data.frame(M_other) |>
+  tibble::rownames_to_column("Sample") |>
+  tidyr::pivot_longer(-Sample, names_to = "ASV", values_to = "Abundance") |>
+  dplyr::mutate(Zone = sd$..zone..[match(Sample, rownames(sd))]) |>
+  dplyr::filter(!is.na(Zone))
+
+zone_asv <- df_other |>
+  dplyr::group_by(Zone, ASV) |>
+  dplyr::summarise(Abundance = sum(Abundance), .groups = "drop")
+
+tot_other <- zone_asv |>
+  dplyr::group_by(Zone) |>
+  dplyr::summarise(TotalOther = sum(Abundance), .groups = "drop")
+
+zone_asv <- zone_asv |>
+  dplyr::left_join(tot_other, by = "Zone") |>
+  dplyr::mutate(PropWithinOther = ifelse(TotalOther > 0, Abundance / TotalOther, 0))
+
+
+## 5) Use ALL ASVs (no cap) and set a consistent stack order
+asv_order <- zone_asv |>
+  dplyr::group_by(ASV) |>
+  dplyr::summarise(Total = sum(Abundance), .groups = "drop") |>
+  dplyr::arrange(dplyr::desc(Total)) |>
+  dplyr::pull(ASV)
+
+zone_asv$ASV <- factor(zone_asv$ASV, levels = asv_order)
+
+# ---- North/South–tinted palette for ASVs (no legend) ----
+user_colors <- c(North = "#7F96FF", South = "#FF7518")
+
+# helper: mix a color with a background (0 = pure color, 1 = pure bg)
+mix_col <- function(col, bg = "#FFFFFF", p = 0.5) {
+  c1 <- col2rgb(col)/255; c2 <- col2rgb(bg)/255
+  m  <- (1 - p) * c1 + p * c2
+  rgb(m[1], m[2], m[3])
+}
+
+# Determine each ASV’s "dominant zone" (where it's most abundant within Other)
+dom <- zone_asv |>
+  dplyr::group_by(ASV) |>
+  dplyr::slice_max(Abundance, n = 1, with_ties = FALSE) |>
+  dplyr::ungroup()
+
+# Rank ASVs within each dominant zone by abundance (to spread tints)
+dom <- dom |>
+  dplyr::group_by(Zone) |>
+  dplyr::arrange(dplyr::desc(Abundance), .by_group = TRUE) |>
+  dplyr::mutate(rank_in_zone = dplyr::row_number()) |>
+  dplyr::ungroup()
+
+# Build zone-specific tint ladders (light → dark of the zone color)
+n_by_zone <- table(dom$Zone)
+shade_pos <- lapply(as.list(n_by_zone), function(n) seq(0.15, 0.85, length.out = n))
+names(shade_pos) <- names(n_by_zone)
+
+dom$p   <- mapply(function(z, r) shade_pos[[z]][r], dom$Zone, dom$rank_in_zone)
+dom$col <- mapply(function(z, p) mix_col(user_colors[z], "#FFFFFF", p), dom$Zone, dom$p)
+
+# Align to your ASV factor levels used in the plots
+asv_levels <- levels(zone_asv$ASV)
+pal_asv    <- setNames(dom$col[match(asv_levels, dom$ASV)], asv_levels)
+pal_asv[is.na(pal_asv)] <- "#BBBBBB"   # fallback, should be rare
+
+## --- Label data: how many ASVs contribute to "Other" in each Zone? ---
+labels_norm <- zone_asv %>%
+  dplyr::group_by(Zone) %>%
+  dplyr::summarise(n_ASVs = sum(Abundance > 0), .groups = "drop") %>%
+  dplyr::mutate(y = 1.0, lab = paste0(n_ASVs, " ASVs"))
+
+## 6A) NORMALIZED: composition within “Other” (each bar sums to 100%)
+p_other_norm <- ggplot(zone_asv,
+                       aes(x = Zone, y = PropWithinOther, fill = ASV)) +
+  geom_col(width = 0.8, color = "black", linewidth = 0.1) +
+  scale_fill_manual(values = pal_asv) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.05))) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(title = "Composition of ‘Other’ by ASV (normalized within Other)",
+       x = NULL, y = "Share within ‘Other’") +
+  geom_text(data = labels_norm,
+            aes(x = Zone, y = y, label = lab),
+            vjust = -0.3, size = 3.5, inherit.aes = FALSE)
+
+## --- ABSOLUTE view as MEAN per sample (keeps y in 0–1) ---
+zone_asv_abs <- df_other %>%
+  dplyr::group_by(Zone, ASV) %>%
+  dplyr::summarise(Abundance = mean(Abundance), .groups = "drop") %>%  # mean per sample
+  dplyr::group_by(Zone) %>%
+  dplyr::mutate(TotalOther = sum(Abundance),
+                PropWithinOther = ifelse(TotalOther > 0, Abundance / TotalOther, 0)) %>%
+  dplyr::ungroup()
+
+labels_abs <- zone_asv_abs %>%
+  dplyr::group_by(Zone) %>%
+  dplyr::summarise(n_ASVs = sum(Abundance > 0),
+                   TotalOther = sum(Abundance), .groups = "drop") %>%
+  dplyr::mutate(lab = paste0(n_ASVs, " ASVs"))
+
+# keep ASV order consistent with the normalized plot
+zone_asv_abs$ASV <- factor(zone_asv_abs$ASV, levels = levels(zone_asv$ASV))
+
+## 6B) ABSOLUTE: mean fraction of total reads in “Other” (per Zone)
+p_other_abs <- ggplot(zone_asv_abs,
+                      aes(x = Zone, y = Abundance, fill = ASV)) +
+  geom_col(width = 0.8, color = "black", linewidth = 0.1) +
+  scale_fill_manual(values = pal_asv) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.05))) +
+  theme_classic(base_size = 12) +
+  theme(legend.position = "none") +
+  labs(title = "Composition of ‘Other’ by ASV (mean fraction per sample)",
+       x = NULL, y = "Mean fraction of total reads") +
+  geom_text(data = labels_abs,
+            aes(x = Zone, y = TotalOther, label = lab),
+            vjust = -0.3, size = 3.5, inherit.aes = FALSE)
+
+
+
+print(p_other_norm)
+print(p_other_abs)
+
+
+## --- record software + package versions for Methods/Supplement ---
+## assumes base_dir already defined; otherwise set:
+# base_dir <- getwd()
+
+dir_out <- file.path(base_dir, "4.results")
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+# 1) Full session info (OS, R, attached pkgs, etc.)
+si_path <- file.path(dir_out, "sessionInfo.txt")
+utils::capture.output(utils::sessionInfo(), file = si_path)
+message("Wrote: ", si_path)
+
+# 2) Package versions table (add/remove as needed)
+pkgs <- c(
+  "dada2","phyloseq","Biostrings","ShortRead","decontam","microbiome",
+  "ggplot2","readr","stringr","tidyverse","scales","dplyr","tidyr",
+  "ranacapa","ggtext","ragg"
+)
+
+get_pkg_ver <- function(p) {
+  if (requireNamespace(p, quietly = TRUE)) as.character(utils::packageVersion(p)) else NA_character_
+}
+
+pkg_df <- data.frame(
+  Package = pkgs,
+  Version = vapply(pkgs, get_pkg_ver, character(1)),
+  stringsAsFactors = FALSE
+)
+
+pkg_csv <- file.path(dir_out, "package_versions.csv")
+utils::write.csv(pkg_df, pkg_csv, row.names = FALSE)
+message("Wrote: ", pkg_csv)
+
+# 3) cutadapt version (external tool)
+detect_cutadapt <- function() {
+  cands <- character(0)
+  if (exists("cutadapt") && is.character(cutadapt) && nzchar(cutadapt) && file.exists(cutadapt)) {
+    cands <- c(cands, cutadapt)
+  }
+  sys <- Sys.which("cutadapt"); if (nzchar(sys)) cands <- c(cands, sys)
+  cands <- c(cands,
+             Sys.glob("~/Library/Python/*/bin/cutadapt"),
+             Sys.glob("~/.local/bin/cutadapt"),
+             "/opt/homebrew/bin/cutadapt", "/usr/local/bin/cutadapt")
+  cands <- unique(cands[file.exists(cands)])
+  if (length(cands)) cands[1] else NA_character_
+}
+
+ca_path <- detect_cutadapt()
+ca_ver  <- if (!is.na(ca_path)) tryCatch(system2(ca_path, "--version", stdout = TRUE, stderr = TRUE), error = function(e) NA_character_) else NA_character_
+
+ca_txt <- file.path(dir_out, "cutadapt_version.txt")
+writeLines(c(
+  paste("cutadapt_path:", ifelse(is.na(ca_path), "NA", ca_path)),
+  paste("cutadapt_version:", if (length(ca_ver) && !is.na(ca_ver[1])) ca_ver[1] else "NA")
+), ca_txt)
+message("Wrote: ", ca_txt)
+
+
