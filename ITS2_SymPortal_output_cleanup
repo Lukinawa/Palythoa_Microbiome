@@ -1,0 +1,303 @@
+suppressPackageStartupMessages({
+  library(readr); library(dplyr); library(tidyr); library(stringr); library(scales)
+})
+
+# ================== PATHS (update if needed) ==================
+f_meta <- "/Users/luki/Downloads/output/analyses/20250901T132441/its2_type_profiles/5_20250901_Lukas_Palythoa_analysis_20250901T132441.profiles.absolute.abund_and_meta.txt"
+meta_path <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/0.metadata/thesis_ITS2_metadata_clean.csv" # ";"-delimited
+out_dir <- "full_analysis/2.qc_contaminants/outputs"
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+# ================== READ & PARSE AND_META (robust) ==================
+sp0 <- read_delim(f_meta, delim = "\t", col_names = FALSE, trim_ws = TRUE, show_col_types = FALSE)
+row_chr <- function(df,i) as.character(df[i,,drop=TRUE])
+r_uid   <- which(sp0$X1 %in% c("ITS2 type profile UID","ITS2_type_profile_UID"))[1]
+r_label <- which(sp0$X1 %in% c("ITS2 type profile","ITS2_type_profile"))[1]
+r_clade <- which(sp0$X1 %in% c("Clade","clade"))[1]
+stopifnot(!is.na(r_uid), !is.na(r_label))
+
+lab_row <- row_chr(sp0, r_label)
+prof_idx <- which(lab_row != "" & !is.na(lab_row)); prof_idx <- prof_idx[prof_idx > 2]
+stopifnot(length(prof_idx) > 0)
+
+profile_labels <- row_chr(sp0, r_label)[prof_idx]
+profile_uids   <- row_chr(sp0, r_uid)[prof_idx]
+clades         <- if (!is.na(r_clade)) row_chr(sp0, r_clade)[prof_idx] else rep(NA_character_, length(prof_idx))
+
+is_data <- grepl("^[0-9]+$", sp0$X1) & !is.na(sp0$X2) & nzchar(sp0$X2)
+dat <- sp0[is_data, c(1,2,prof_idx), drop=FALSE]
+colnames(dat) <- c("sample_uid","sample_name", profile_labels)
+num_cols <- setdiff(colnames(dat), c("sample_uid","sample_name"))
+suppressWarnings({ dat[num_cols] <- lapply(dat[num_cols], \(x) as.numeric(gsub(",", ".", as.character(x)))) })
+
+# ================== BUILD RAW TABLES (with names) ==================
+counts_wide <- dat %>%
+  mutate(sample_uid=as.character(sample_uid), sample_name=as.character(sample_name)) %>%
+  relocate(sample_name, sample_uid) %>% arrange(sample_name)
+
+counts_long <- counts_wide %>%
+  pivot_longer(-c(sample_name, sample_uid), names_to = "ITS2_type_profile", values_to = "reads") %>%
+  mutate(reads = replace_na(reads, 0L)) %>%
+  group_by(sample_name) %>%
+  mutate(total_reads = sum(reads), rel_abund = ifelse(total_reads>0, reads/total_reads, 0)) %>%
+  ungroup()
+
+write_csv(counts_wide, file.path(out_dir, "RAW_counts_wide_WITH_NAMES.csv"))
+write_csv(counts_long, file.path(out_dir, "RAW_counts_long_WITH_NAMES.csv"))
+
+# (lookup for legends/reporting)
+write_csv(tibble(ITS2_type_profile=profile_labels, profile_uid=profile_uids, clade=clades),
+          file.path(out_dir, "ITS2_profile_lookup.csv"))
+
+# ================== TAG NEGATIVES FROM YOUR METADATA ==================
+NegCtrl <- NULL
+if (file.exists(meta_path)) {
+  meta <- read_delim(meta_path, delim=";", show_col_types = FALSE)
+  if ("sample_name" %in% names(meta)) {
+    neg_map <- meta %>%
+      mutate(sample_name = str_trim(as.character(sample_name)),
+             NegCtrl = tolower(sample_type) %in% c("negative_control","neg","negative","blank","ntc","control")) %>%
+      distinct(sample_name, NegCtrl)
+    counts_long <- counts_long %>% left_join(neg_map, by="sample_name")
+    counts_wide <- counts_wide %>% left_join(neg_map, by="sample_name") %>% relocate(NegCtrl, .after=sample_name)
+  }
+}
+
+# ================== BACKGROUND SUBTRACTION (NO SAMPLE DROPS) ==================
+# tune if desired:
+min_neg_reads <- 1000   # only trust NCs with >= this many reads
+bg_quantile   <- 0.95   # robust per-profile rel background
+margin        <- 1.10   # small safety margin
+fallback_bg   <- 0.005  # fallback 0.5% rel if NCs too shallow
+
+neg_good_ids <- counts_long %>%
+  filter(!is.na(NegCtrl) & NegCtrl) %>%
+  group_by(sample_name) %>% summarise(total_reads = max(total_reads), .groups="drop") %>%
+  filter(total_reads >= min_neg_reads) %>% pull(sample_name)
+
+neg_bg <- counts_long %>%
+  filter(sample_name %in% neg_good_ids) %>%
+  group_by(ITS2_type_profile) %>%
+  summarise(bg_rel = quantile(rel_abund, bg_quantile, na.rm=TRUE), .groups="drop")
+
+if (!nrow(neg_bg)) {
+  neg_bg <- counts_long %>% distinct(ITS2_type_profile) %>% mutate(bg_rel = fallback_bg)
+  message("No negatives with ≥ ", min_neg_reads, " reads; using fallback background = ", fallback_bg*100, "%")
+}
+neg_bg <- neg_bg %>% mutate(bg_rel = pmin(1, bg_rel * margin))
+
+clean_long <- counts_long %>%
+  left_join(neg_bg, by="ITS2_type_profile") %>%
+  mutate(bg_rel = replace_na(bg_rel, 0),
+         reads_sub = pmax(reads - round(bg_rel * total_reads), 0L)) %>%
+  group_by(sample_name) %>%
+  mutate(total_reads_sub = sum(reads_sub),
+         rel_clean = ifelse(total_reads_sub>0, reads_sub/total_reads_sub, 0)) %>%
+  ungroup()
+
+write_csv(clean_long %>% select(sample_name, NegCtrl, ITS2_type_profile, reads_raw=reads,
+                                total_reads_raw=total_reads, bg_rel_profile=bg_rel,
+                                reads_sub, total_reads_sub, rel_clean),
+          file.path(out_dir, "CLEAN_subtracted_counts_long.csv"))
+
+# ================== NC SNAPSHOT ==================
+nc_summary <- counts_long %>%
+  filter(!is.na(NegCtrl) & NegCtrl) %>%
+  group_by(sample_name) %>%
+  summarise(total_reads = max(total_reads),
+            top_profile = ITS2_type_profile[which.max(rel_abund)],
+            top_reads   = reads[which.max(rel_abund)],
+            top_rel     = max(rel_abund), .groups="drop") %>%
+  arrange(desc(total_reads)) %>%
+  mutate(top_rel_pct = percent(top_rel, accuracy = 0.1))
+write_csv(nc_summary, file.path(out_dir, "NEGATIVE_CONTROLS_summary.csv"))
+
+cat("Outputs in ", normalizePath(out_dir), "\n", sep = "")
+cat("Negatives used for background (≥ ", min_neg_reads, " reads): ", length(neg_good_ids), "\n", sep = "")
+print(head(nc_summary, 10), n=10)
+
+
+
+
+###################
+suppressPackageStartupMessages({ library(dplyr); library(readr); library(scales) })
+
+out_dir <- "full_analysis/2.qc_contaminants/outputs"
+
+# Use in-memory table if it exists, otherwise read what we saved earlier
+if (!exists("counts_long")) {
+  counts_long <- read_csv(file.path(out_dir, "RAW_counts_long_WITH_NAMES.csv"), show_col_types = FALSE)
+}
+
+# Ensure NegCtrl column exists (if you didn’t join metadata earlier, we’ll assume FALSE)
+if (!"NegCtrl" %in% names(counts_long)) counts_long$NegCtrl <- FALSE
+
+# 1) Per-sample summary: total reads, top profile, top reads, top %
+sample_summary <- counts_long %>%
+  group_by(sample_name) %>%
+  # take the row with max reads within each sample
+  slice_max(order_by = reads, n = 1, with_ties = FALSE) %>%
+  # the row now contains top profile + its reads + rel_abund; but total_reads is in all rows
+  transmute(
+    sample_name,
+    NegCtrl = NegCtrl,
+    total_reads = total_reads,
+    top_profile = ITS2_type_profile,
+    top_reads   = reads,
+    top_rel     = rel_abund,
+    top_rel_pct = percent(top_rel, accuracy = 0.1)
+  ) %>%
+  arrange(desc(NegCtrl), desc(total_reads), sample_name)
+
+# 2) Print a clear comparison (first NCs, then real samples)
+cat("\n--- NEGATIVE CONTROLS (by total_reads) ---\n")
+print(sample_summary %>% filter(NegCtrl) %>% arrange(desc(total_reads)) %>% head(20), n = 20)
+
+cat("\n--- REAL SAMPLES (by total_reads) ---\n")
+print(sample_summary %>% filter(!NegCtrl) %>% arrange(desc(total_reads)) %>% head(20), n = 20)
+
+# 3) Quick stats per group (how many reads / dominance)
+cat("\n--- Summary stats (NC vs Real) ---\n")
+stats_tbl <- sample_summary %>%
+  group_by(NegCtrl) %>%
+  summarise(
+    n = n(),
+    min_reads = min(total_reads),
+    q25_reads = quantile(total_reads, 0.25),
+    median_reads = median(total_reads),
+    mean_reads = round(mean(total_reads), 1),
+    q75_reads = quantile(total_reads, 0.75),
+    max_reads = max(total_reads),
+    median_top_rel = median(top_rel),
+    p_top_ge90 = mean(top_rel >= 0.90),
+    p_top_ge80 = mean(top_rel >= 0.80),
+    .groups = "drop"
+  )
+print(stats_tbl)
+
+# 4) Save to CSV (so you can sort/filter in Excel)
+write_csv(sample_summary, file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"))
+cat("\nWrote: ", file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"), "\n", sep = "")
+
+
+
+
+##############
+
+suppressPackageStartupMessages({ library(dplyr); library(readr); library(scales) })
+
+out_dir <- "full_analysis/2.qc_contaminants/outputs"
+
+# Load if needed
+if (!exists("counts_long")) {
+  counts_long <- read_csv(file.path(out_dir, "RAW_counts_long_WITH_NAMES.csv"), show_col_types = FALSE)
+}
+if (!"NegCtrl" %in% names(counts_long)) counts_long$NegCtrl <- FALSE
+
+# Per-sample: total reads, top profile, top reads, top %
+sample_summary <- counts_long %>%
+  group_by(sample_name) %>%
+  slice_max(order_by = reads, n = 1, with_ties = FALSE) %>%
+  transmute(
+    sample_name,
+    NegCtrl,
+    total_reads = total_reads,
+    top_profile = ITS2_type_profile,
+    top_reads   = reads,
+    top_rel     = rel_abund,
+    top_rel_pct = percent(top_rel, accuracy = 0.1)
+  )
+
+# Depth benchmarks from NCs
+nc_stats <- sample_summary %>%
+  filter(NegCtrl) %>%
+  summarise(
+    n_nc = n(),
+    nc_min = min(total_reads),
+    nc_q25 = quantile(total_reads, 0.25),
+    nc_median = median(total_reads),
+    nc_q75 = quantile(total_reads, 0.75),
+    nc_max = max(total_reads)
+  )
+
+nc_median <- if (nrow(nc_stats)) nc_stats$nc_median[1] else NA_real_
+
+# Flag real samples shallower than NC median
+sample_summary <- sample_summary %>%
+  mutate(below_nc_median = ifelse(!NegCtrl & !is.na(nc_median) & total_reads < nc_median, TRUE, FALSE))
+
+# Print comparison
+cat("\n--- NEGATIVE CONTROLS (by total_reads) ---\n")
+print(sample_summary %>% filter(NegCtrl) %>% arrange(desc(total_reads)), n = Inf)
+
+cat("\n--- REAL SAMPLES (by total_reads) ---\n")
+print(sample_summary %>%
+        filter(!NegCtrl) %>%
+        arrange(below_nc_median, desc(total_reads)),
+      n = Inf)
+
+cat("\n--- Depth benchmark (from NCs) ---\n")
+print(nc_stats)
+
+# Group stats (dominance & depth)
+cat("\n--- Summary stats (NC vs Real) ---\n")
+print(
+  sample_summary %>%
+    group_by(NegCtrl) %>%
+    summarise(
+      n = n(),
+      median_reads = median(total_reads),
+      p_top_ge90 = mean(top_rel >= 0.90),
+      p_top_ge80 = mean(top_rel >= 0.80),
+      .groups = "drop"
+    )
+)
+
+# Save CSV for Excel
+write_csv(sample_summary, file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"))
+cat("\nWrote: ", file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"), "\n", sep = "")
+
+
+library(readr)
+library(dplyr)
+
+out_dir <- "full_analysis/2.qc_contaminants/outputs"
+
+tbl <- read_csv(file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"), show_col_types = FALSE)
+
+# ensure NegCtrl is logical (just in case it got saved as text)
+if (!is.logical(tbl$NegCtrl)) {
+  tbl <- tbl %>% mutate(NegCtrl = NegCtrl %in% c(TRUE, "TRUE", "True", "1", "yes", "Yes"))
+}
+
+tbl_sorted <- tbl %>%
+  arrange(desc(NegCtrl), desc(total_reads), sample_name)
+
+# print and save
+print(tbl_sorted, n = Inf)
+write_csv(tbl_sorted, file.path(out_dir, "SAMPLE_top_profile_summary_RAW_sorted.csv"))
+
+
+library(readr)
+library(dplyr)
+library(stringr)
+
+out_dir <- "full_analysis/2.qc_contaminants/outputs"
+
+# (optional) scrub any stray tabs from text fields so they don't break TSV
+scrub_tabs <- function(df) {
+  df %>% mutate(across(where(is.character), ~ str_replace_all(.x, "\t", " ")))
+}
+
+# example: write your sorted summary as TSV
+tbl_sorted <- readr::read_csv(file.path(out_dir, "SAMPLE_top_profile_summary_RAW.csv"), show_col_types = FALSE) %>%
+  mutate(NegCtrl = NegCtrl %in% c(TRUE, "TRUE", "True", "1", "yes", "Yes")) %>%
+  arrange(desc(NegCtrl), desc(total_reads), sample_name) %>%
+  scrub_tabs()
+
+readr::write_tsv(tbl_sorted, file.path(out_dir, "SAMPLE_top_profile_summary_RAW_sorted.tsv"))
+
+# also write TSV versions of the counts if you like
+# readr::write_tsv(counts_wide, file.path(out_dir, "RAW_counts_wide_WITH_NAMES.tsv"))
+# readr::write_tsv(counts_long, file.path(out_dir, "RAW_counts_long_WITH_NAMES.tsv"))
+
