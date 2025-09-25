@@ -1,0 +1,1238 @@
+#########################
+## SymPortal → ggplots ##
+#########################
+
+## ---- Packages ----
+need <- c("tidyverse","readr","jsonlite","purrr")
+to_install <- setdiff(need, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+library(tidyverse); library(readr); library(jsonlite); library(purrr)
+
+## ---- Paths ----
+sp_root     <- "/Users/luki/Downloads/output"
+analysis_id <- "20250901T132441"
+
+profiles_dir <- file.path(sp_root, "analyses", analysis_id, "its2_type_profiles")
+html_dir     <- file.path(sp_root, "analyses", analysis_id, "html")
+abund_only_fp <- list.files(profiles_dir, pattern = "\\.profiles\\.relative\\.abund_only\\.txt$", full.names = TRUE)[1]
+meta_only_fp  <- list.files(profiles_dir, pattern = "\\.profiles\\.meta_only\\.txt$",    full.names = TRUE)[1]
+meta_fp <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/0.metadata/thesis_ITS2_metadata_clean.csv"
+
+stopifnot(file.exists(abund_only_fp), file.exists(meta_only_fp), file.exists(meta_fp))
+
+## ---- Helpers ----
+.read_delim_guess <- function(fp){
+  x <- suppressWarnings(read_tsv(fp, guess_max = 10000, show_col_types = FALSE))
+  if (ncol(x) <= 1) x <- suppressWarnings(read_delim(fp, delim = ",", guess_max = 10000, show_col_types = FALSE))
+  x
+}
+
+
+
+## ---- Readers (return 'sample_name') ----
+read_abund_only <- function(fp){
+  tab <- .read_delim_guess(fp); stopifnot(nrow(tab) > 0)
+  first_col <- names(tab)[1]; rest <- setdiff(names(tab), first_col)
+  tab[rest] <- lapply(tab[rest], \(v) suppressWarnings(readr::parse_number(as.character(v))))
+  profiles_as_rows <- sum(vapply(tab[rest], is.numeric, logical(1))) >= length(rest)*0.8 && (ncol(tab)-1 > nrow(tab))
+  if (!profiles_as_rows){
+    tab <- tab[c(first_col, rest[colSums(sapply(tab[rest], \(z) is.finite(z)&z>0))>0])]
+    tab <- tab |> rename(sample_name = all_of(first_col))
+    long <- tab |> pivot_longer(-sample_name, names_to="ITS2_profile", values_to="rel_abund") |> filter(rel_abund>0)
+  } else {
+    names(tab)[1] <- "ITS2_profile"
+    long <- tab |> pivot_longer(-ITS2_profile, names_to="sample_name", values_to="rel_abund") |> filter(rel_abund>0)
+  }
+  long |> mutate(sample_name = as.character(sample_name), ITS2_profile = as.character(ITS2_profile))
+}
+read_profiles_meta <- function(fp){
+  .read_delim_guess(fp) |>
+    transmute(
+      UID = as.character(`ITS2 type profile UID`),
+      ITS2_name = as.character(`ITS2 type profile`)
+    ) |>
+    distinct(UID, .keep_all = TRUE)
+}
+## ---- Load data ----
+ab_long <- read_abund_only(abund_only_fp)
+user_meta <- read_delim(meta_fp, delim=";", trim_ws=TRUE, show_col_types=FALSE) |>
+  mutate(sample_name = as.character(sample_name))
+
+## ---- Standardised key + dedup thesis meta ----
+std_id <- function(x) x |> as.character() |> stringr::str_trim() |>
+  stringr::str_to_lower() |> stringr::str_replace_all("[\\s_/.-]+","")
+
+user_meta <- user_meta |> mutate(sample_join = std_id(sample_name))
+user_meta_dedup <- user_meta |>
+  arrange(sample_name) |>
+  distinct(sample_join, .keep_all = TRUE)
+
+## ---- Map internal 3-digit IDs → sample_name (only if needed) ----
+is_numeric_like <- function(x) all(grepl("^[0-9]+$", std_id(stats::na.omit(x))))
+internal_like <- is_numeric_like(ab_long$sample_name)
+if (internal_like) {
+  post_dirs <- c(
+    file.path(sp_root, "analyses", analysis_id, "post_med_seqs"),
+    file.path(sp_root, "loaded_data_sets", substr(analysis_id, 1, 15), "post_med_seqs")
+  )
+  
+  meta_candidates <- post_dirs %>%
+    purrr::keep(dir.exists) %>%
+    purrr::map(function(d) list.files(d, pattern = "seqs\\..*meta_only\\.txt$", full.names = TRUE)) %>%
+    unlist() %>%
+    unique()
+  
+  pick_sample_map <- function(fp) {
+    m <- suppressWarnings(readr::read_tsv(fp, guess_max = 10000, show_col_types = FALSE))
+    if (ncol(m) <= 1) {
+      m <- suppressWarnings(readr::read_delim(fp, delim = ",", guess_max = 10000, show_col_types = FALSE))
+    }
+    if (!nrow(m)) return(NULL)
+    
+    cols <- names(m)
+    name_cols <- cols[grepl("sample.?name|^name$|^sample$", tolower(cols))]
+    if ("sample_name" %in% cols) {
+      name_cols <- c("sample_name", setdiff(name_cols, "sample_name"))
+    }
+    
+    id_cols <- cols[grepl("uid$|uid_|^uid$|sample.?id$|^id$|_id$", tolower(cols))]
+    id_cols <- id_cols[vapply(m[id_cols], function(v) {
+      all(grepl("^[0-9]+$", na.omit(as.character(v))))
+    }, logical(1))]
+    
+    if (!length(name_cols) || !length(id_cols)) return(NULL)
+    
+    tibble::tibble(
+      key_std     = std_id(m[[id_cols[1]]]),
+      sample_name = as.character(m[[name_cols[1]]])
+    ) %>%
+      dplyr::filter(key_std != "", !is.na(sample_name), sample_name != "") %>%
+      dplyr::distinct(key_std, .keep_all = TRUE)
+  }
+  
+  map_from_post <- meta_candidates %>%
+    purrr::map(pick_sample_map) %>%
+    purrr::compact() %>%
+    dplyr::bind_rows() %>%
+    dplyr::distinct(key_std, .keep_all = TRUE)
+  
+  # optional: also try html/study_data.js if present
+  if (!file.exists(file.path(html_dir, "study_data.js"))) {
+    cand <- list.files(sp_root, pattern = "study_data\\.js$", recursive = TRUE, full.names = TRUE)
+    cand <- c(cand[grepl(analysis_id, cand)], setdiff(cand, cand[grepl(analysis_id, cand)]))
+    if (length(cand)) html_dir <- dirname(cand[1])
+  }
+  
+  read_study_map <- function(js_path) {
+    if (!file.exists(js_path)) return(NULL)
+    txt <- readr::read_file(js_path)
+    
+    name_pos <- gregexpr("\"sample_name\"\\s*:\\s*\"([^\"]+)\"", txt, perl = TRUE)[[1]]
+    if (length(name_pos) <= 0 || name_pos[1] == -1) return(NULL)
+    
+    name_matches <- regmatches(txt, gregexpr("\"sample_name\"\\s*:\\s*\"([^\"]+)\"", txt, perl = TRUE))[[1]]
+    sample_names <- sub('^"sample_name"\\s*:\\s*"([^"]+)".*$', "\\1", name_matches)
+    
+    get_id_before <- function(pos) {
+      window <- substr(txt, max(1, pos - 400), pos + 200)
+      m <- regexpr('"sample_id"\\s*:\\s*(\\d+)|"sample_uid"\\s*:\\s*(\\d+)|"uid"\\s*:\\s*(\\d+)|"id"\\s*:\\s*(\\d+)', window, perl = TRUE)
+      if (m[1] == -1) return(NA_character_)
+      match_txt <- regmatches(window, m)[1]
+      digits <- regmatches(match_txt, regexpr("(\\d+)", match_txt))
+      as.character(digits)
+    }
+    
+    ids <- vapply(name_pos, get_id_before, character(1))
+    
+    tibble::tibble(
+      key_std     = std_id(ids),
+      sample_name = as.character(sample_names)
+    ) %>%
+      dplyr::filter(key_std != "", sample_name != "") %>%
+      dplyr::distinct(key_std, .keep_all = TRUE)
+  }
+  
+  map_from_html <- read_study_map(file.path(html_dir, "study_data.js"))
+  
+  mapping <- list(map_from_post, map_from_html) %>%
+    purrr::map(function(x) {
+      if (is.null(x) || !nrow(x)) {
+        tibble::tibble(key_std = character(), sample_name = character())
+      } else x
+    }) %>%
+    dplyr::bind_rows() %>%
+    dplyr::distinct(key_std, .keep_all = TRUE)
+  
+  ab_long <- ab_long %>%
+    dplyr::mutate(key_std = std_id(sample_name)) %>%
+    dplyr::left_join(mapping, by = "key_std") %>%
+    dplyr::mutate(sample_name = dplyr::coalesce(sample_name.y, sample_name.x)) %>%
+    dplyr::select(-key_std, -sample_name.x, -sample_name.y)
+}
+
+# If you still have the pre-mapping ID, great; if not, reconstruct a proxy
+# Rebuild a "key" that distinguishes original rows (profile + value) per sample
+ab_keyed <- ab_long %>%
+  mutate(.row_id = dplyr::row_number()) %>%
+  select(.row_id, sample_name, ITS2_profile, rel_abund)
+
+dup_map <- ab_keyed %>%
+  group_by(sample_name) %>%
+  summarise(n_distinct_profiles = n_distinct(ITS2_profile),
+            n_rows = dplyr::n(), .groups="drop") %>%
+  arrange(desc(n_rows))
+
+print(dup_map %>% filter(grepl("NC", sample_name) | sample_name %in% c("mak08")), n = Inf)
+
+# Inspect mak08 specifically
+ab_keyed %>% filter(sample_name == "mak08") %>%
+  arrange(ITS2_profile) %>% print(n = Inf)
+
+
+
+## ---- Final join (USE DEDUP) ----
+ab_long_join <- ab_long |> mutate(sample_join = std_id(sample_name))
+joined <- ab_long_join |>
+  left_join(user_meta_dedup %>% select(-sample_name), by="sample_join") |>
+  mutate(sample_name = as.character(sample_name)) |>
+  select(-sample_join)
+
+if (!"Site" %in% names(joined)) joined$Site <- "Unknown"
+if (!"Zone" %in% names(joined)) joined$Zone <- "Unknown"
+
+
+
+
+## ---- EXCLUDE NEGATIVE CONTROLS (robust) ----
+# 1) From metadata flag, if present
+neg_names_meta <- character(0)
+if ("NegCtrl" %in% names(user_meta_dedup)) {
+  neg_names_meta <- user_meta_dedup %>%
+    dplyr::filter(!!rlang::sym("NegCtrl") %in% c(TRUE, "TRUE", "True", 1, "1")) %>%
+    dplyr::pull(sample_name) %>% as.character()
+}
+
+# 2) From naming pattern: samples that END with "NC" (case-insensitive)
+neg_pat <- "(?i)nc$"
+neg_names_pat <- unique(joined$sample_name[grepl(neg_pat, joined$sample_name)])
+
+# 3) Drop union of both
+neg_names <- unique(c(neg_names_meta, neg_names_pat))
+if (length(neg_names)) {
+  message("Dropping negatives: ", paste(neg_names, collapse = ", "))
+}
+joined <- joined %>% dplyr::filter(!sample_name %in% neg_names)
+
+
+
+## ---- UID → label, aggregate, NORMALIZE PER SAMPLE ----
+uid_map <- read_profiles_meta(meta_only_fp)
+
+joined_named <- joined %>%
+  mutate(ITS2_profile = as.character(ITS2_profile)) %>%
+  left_join(uid_map, by = c("ITS2_profile" = "UID")) %>%
+  mutate(ITS2_label = dplyr::coalesce(ITS2_name, ITS2_profile)) %>%
+  select(-ITS2_name)
+
+
+## ---- Site + Zone mapping ----
+library(stringr)
+# 1) Derive a 'Site' code from sample_name.
+#    Rules:
+#    - Lowercase
+#    - Strip trailing "NC" (negative controls)
+#    - Keep leading letters and one optional hyphen group (e.g., "res-mak10" -> "res-mak")
+site_from_sample <- function(x){
+  x %>%
+    tolower() %>%
+    str_replace("(nc)$", "") %>%                 # drop trailing NC
+    str_extract("^[a-z]+(?:-[a-z]+)?") %>%       # take e.g. "ada", "mak", "res-mak"
+    replace_na("unknown")
+}
+unique_sites <- joined_named %>%
+  dplyr::distinct(sample_name) %>%
+  dplyr::mutate(Site = site_from_sample(sample_name)) %>%
+  dplyr::pull(Site) %>% unique()
+print(unique_sites)
+
+
+
+# 2) 'Site' codes North vs South.
+north_sites <- c("ada","bis","oku"
+)
+south_sites <- c("mak","miz","res-mak","res-miz","res-sun"
+)
+
+# 3) Build the site→zone lookup table
+site2zone <- tibble::tibble(
+  Site = c(north_sites, south_sites),
+  Zone = c(rep("North", length(north_sites)), rep("South", length(south_sites)))
+)
+
+# 4) Create facet_lookup for every sample (1 row per sample), then attach Zone
+facet_lookup <- joined_named %>%
+  dplyr::distinct(sample_name) %>%
+  dplyr::mutate(Site = site_from_sample(sample_name)) %>%
+  dplyr::left_join(site2zone, by = "Site") %>%
+  dplyr::mutate(Zone = dplyr::coalesce(Zone, "Unknown"))
+
+# (optional) See which sites weren’t mapped to a Zone yet
+unmapped_sites <- facet_lookup %>% dplyr::filter(Zone == "Unknown") %>% dplyr::distinct(Site)
+if (nrow(unmapped_sites)) {
+  message("Sites missing in your North/South lists: ",
+          paste(unmapped_sites$Site, collapse = ", "))
+}
+
+## ---- Continue with your aggregation that adds 'Unprofiled' ----
+# 1) collapse profiles at sample+label
+agg_core <- joined_named %>%
+  dplyr::group_by(sample_name, ITS2_label) %>%
+  dplyr::summarise(rel_abund = sum(rel_abund, na.rm = TRUE), .groups = "drop")
+
+# 2) add Unprofiled slice
+totals <- agg_core %>% dplyr::group_by(sample_name) %>%
+  dplyr::summarise(tot = sum(rel_abund, na.rm = TRUE), .groups = "drop")
+unprofiled <- totals %>% dplyr::transmute(sample_name, ITS2_label = "Unprofiled",
+                                          rel_abund = pmax(0, 1 - tot))
+agg_full <- dplyr::bind_rows(agg_core, unprofiled)
+
+# 3) attach Site/Zone from the lookup (no row inflation)
+joined_agg <- agg_full %>% dplyr::left_join(facet_lookup, by = "sample_name")
+
+# After you build `joined_agg` (already NC-free):
+joined_agg <- joined_agg %>%
+  dplyr::filter(!is.na(sample_name) & sample_name != "")
+
+# Recompute `facet_lookup` from the NC-free set:
+facet_lookup <- joined_agg %>%
+  dplyr::distinct(sample_name) %>%
+  dplyr::mutate(Site = site_from_sample(sample_name)) %>%
+  dplyr::left_join(site2zone, by = "Site") %>%
+  dplyr::mutate(Zone = dplyr::coalesce(Zone, "Unknown"))
+
+
+# sanity: bars sum to 1
+check_totals <- joined_agg %>% dplyr::group_by(sample_name) %>%
+  dplyr::summarise(total = sum(rel_abund), .groups="drop")
+stopifnot(all(abs(check_totals$total - 1) < 1e-8))
+
+
+## ---- Collapse profiles, add "Unprofiled", attach facets, prep plot ----
+
+# 1) Collapse duplicates strictly by sample + type label (no Site/Zone here)
+agg_core <- joined_named %>%
+  dplyr::group_by(sample_name, ITS2_label) %>%
+  dplyr::summarise(rel_abund = sum(rel_abund, na.rm = TRUE), .groups = "drop")
+
+# 2) Compute profiled totals and create the "Unprofiled" slice = 1 - total
+totals <- agg_core %>%
+  dplyr::group_by(sample_name) %>%
+  dplyr::summarise(tot = sum(rel_abund, na.rm = TRUE), .groups = "drop")
+
+unprofiled <- totals %>%
+  dplyr::transmute(sample_name, ITS2_label = "Unprofiled", rel_abund = pmax(0, 1 - tot))
+
+# Combine profiled + unprofiled (now each sample can sum to exactly 1)
+agg_full <- dplyr::bind_rows(agg_core, unprofiled)
+
+
+joined_agg <- agg_full %>%
+  dplyr::left_join(facet_lookup, by = "sample_name")
+
+# 4) Sanity: every sample should sum to 1 exactly
+check_totals <- joined_agg %>%
+  dplyr::group_by(sample_name) %>%
+  dplyr::summarise(total = sum(rel_abund), .groups = "drop")
+print(check_totals %>% dplyr::filter(abs(total - 1) > 1e-8), n = Inf) # should print nothing
+
+# 5) Top-N (exclude Unprofiled from the ranking so it’s always shown separately)
+topN <- 25
+top_labels <- joined_agg %>%
+  dplyr::filter(ITS2_label != "Unprofiled") %>%
+  dplyr::group_by(ITS2_label) %>%
+  dplyr::summarise(total = sum(rel_abund), .groups = "drop") %>%
+  dplyr::arrange(dplyr::desc(total)) %>%
+  dplyr::slice(1:min(topN, n())) %>%
+  dplyr::pull(ITS2_label)
+
+plot_df <- joined_agg %>%
+  dplyr::mutate(
+    ITS2_profile_plot = dplyr::case_when(
+      ITS2_label == "Unprofiled" ~ "Unprofiled",
+      ITS2_label %in% top_labels ~ ITS2_label,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  dplyr::group_by(Site) %>%
+  dplyr::arrange(Site, sample_name, .by_group = TRUE) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(sample_name = factor(sample_name, levels = unique(sample_name)))
+
+# ---- Symbiodiniaceae type-profile palette (replace the old block) ----
+# Make sure topN == 7 above so `top_labels` has 7 items
+# topN <- 7  # <- set this where you compute top_labels
+
+
+
+## ---- Custom colors for specific ITS2 type profiles ----
+custom_cols <- c(
+  "C1-C1c-C1b"               = "#eee54f",  
+  "C1-C3-C1q"                = "#F4C430",  
+  "C1-C42.2"                 = "#65a35c",  
+  "C3"                       = "#498880",  
+  "C3/C1-C1q-C3v-C1n-4057_C" = "#1596a3",  
+  "D1"                       = "#82FFC7",  
+  "Unprofiled"               = "grey70",  
+  "Other"                    = "#9887bf"  
+  
+)
+
+
+
+# lock palette to the fills actually present in your plot_df
+used <- unique(plot_df$ITS2_profile_plot)
+prof_palette <- custom_cols[intersect(names(custom_cols), used)]
+
+# if anything is still missing, color it as "Other"
+missing <- setdiff(used, names(prof_palette))
+if (length(missing)) {
+  prof_palette <- c(prof_palette,
+                    stats::setNames(rep(custom_cols[["Other"]], length(missing)), missing))
+}
+
+# then in your plot: scale_fill_manual(values = prof_palette, name = "ITS2 type profile")
+
+
+
+## ---- One-row plot, no facet, grouped by Zone then Site ----
+library(dplyr)
+library(forcats)
+library(ggtext)
+library(ggplot2)
+library(grid)
+
+# Master zone colors
+zone_cols <- c(North = "#7F96FF", South = "#FF7518", Unknown = "#666666")
+
+
+# 1) Build ordered plotting df: Zone -> Site -> sample
+plot_df <- joined_agg %>%
+  mutate(
+    Zone = fct_explicit_na(Zone, na_level = "Unknown"),
+    Zone = factor(Zone, levels = c("North","South","Unknown"))
+  ) %>%
+  arrange(Zone, Site, sample_name) %>%
+  mutate(
+    # Top-N mapping kept if you already computed top_labels; otherwise compute quickly:
+    # (Comment next 7 lines if you already have top_labels upstream)
+    # ----
+    # topN = 25
+    # ,
+    # ITS2_profile_plot = ITS2_label
+    # ) %>%
+    # group_by(ITS2_label) %>% summarise(total = sum(rel_abund), .groups="drop") %>%
+    # arrange(desc(total)) %>% slice(1:min(topN, n())) %>% pull(ITS2_label) -> top_labels
+    # ----
+    ITS2_profile_plot = case_when(
+      ITS2_label == "Unprofiled" ~ "Unprofiled",
+      ITS2_label %in% top_labels ~ ITS2_label,
+      TRUE ~ "Other"
+    )
+  ) %>%
+  # final sample order: Zone -> Site -> sample
+  group_by(Zone, Site) %>%
+  arrange(Zone, Site, sample_name, .by_group = TRUE) %>%
+  ungroup() %>%
+  mutate(sample_name_ord = factor(sample_name, levels = unique(sample_name)))
+
+# 2) Colored x-axis labels by Zone (no legend needed for labels)
+lab_map <- plot_df %>%
+  distinct(sample_name_ord, Zone) %>%
+  mutate(
+    sample_name_chr = as.character(sample_name_ord),
+    zn = as.character(Zone),
+    label = sprintf("<span style='color:%s'>%s</span>",
+                    zone_cols[zn], sample_name_chr)
+  ) %>%
+  select(sample_name_chr, label) %>%
+  { setNames(.$label, .$sample_name_chr) }
+
+stopifnot(all(levels(plot_df$sample_name_ord) %in% names(lab_map)))
+
+
+
+
+# 4) Ensure profile color palette has Other/Unprofiled & all used fills
+if (is.null(prof_palette)) prof_palette <- c()
+if (!"Other" %in% names(prof_palette))      prof_palette <- c(prof_palette, Other = "#BFBFBF")
+if (!"Unprofiled" %in% names(prof_palette)) prof_palette <- c(prof_palette, Unprofiled = "#707070")
+used_fills <- unique(plot_df$ITS2_profile_plot)
+miss <- setdiff(used_fills, names(prof_palette))
+if (length(miss)) prof_palette <- c(prof_palette, stats::setNames(rep("#BFBFBF", length(miss)), miss))
+
+library(scales)   # for percent_format
+
+# --- build a compact legend string for the x-axis title (only for zones that exist) ---
+present_zones <- unique(as.character(plot_df$Zone))
+present_zones <- present_zones[present_zones %in% names(zone_cols)]
+
+legend_bits <- sprintf(
+  "<span style='color:%s'><b>%s</b></span>",
+  zone_cols[present_zones], present_zones
+)
+legend_x <- paste0(
+  "<span style='color:#000; font-weight:400;'>Samples</span><br>",
+  paste(legend_bits, collapse = " &nbsp;&bull;&nbsp; ")
+)
+
+# --- y label as % ---
+y_lab <- "Relative Abundance (%)"
+
+#library(scales)
+
+p_stacked <- ggplot(plot_df, aes(x = sample_name_ord, y = rel_abund, fill = ITS2_profile_plot)) +
+  geom_bar(stat = "identity", color = "black", linewidth = 0.1, width = 0.85) +
+  scale_fill_manual(values = prof_palette, name = "ITS2-type-profile") +
+  scale_x_discrete(breaks = levels(plot_df$sample_name_ord), labels = lab_map) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    x = legend_x,
+    y = "Relative Abundance (%)",
+    title = ""
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x   = ggtext::element_markdown(size = 16, angle = 45, hjust = 1),
+    axis.title.x  = ggtext::element_markdown(size = 16, margin = margin(t = 8), lineheight = 1.1),
+    plot.title.position = "plot",
+    axis.ticks    = element_line(color = "grey70", linewidth = 0.4),
+    axis.ticks.length.x = unit(2, "pt"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    # legend styling (keeps square keys)
+    legend.title  = element_text(family = "sans", size = 16, face = "bold"),
+    legend.text   = element_text(family = "sans",size = 14),
+    legend.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(
+    fill = guide_legend(
+      title.position = "top",
+      byrow = TRUE,
+      ncol  = 1
+    )
+  )
+
+
+    
+    
+print(p_stacked)
+ggsave(file.path(profiles_dir, "gg_type_profiles_relative_byZoneSite_contiguous.png"),
+       p_stacked, width = 16, height = 7, dpi = 300)
+
+# Save as PDF (for publication-quality)
+ggsave(
+  file.path(profiles_dir, "gg_type_profiles_relative_byZoneSite_contiguous.pdf"),
+  p_stacked, width = 16, height = 7, device = cairo_pdf
+)
+
+
+########################################
+## ===== DIV barplot: Zone→Site ordering, abundant at bottom, legend below =====
+library(dplyr)
+library(forcats)
+library(ggtext)
+library(ggplot2)
+library(grid)
+library(scales)
+
+# 0) Drop NCs if still present
+df <- df %>% filter(!grepl("(?i)nc$", sample_name))
+
+# 1) Long format
+div_cols <- setdiff(names(df), c("sample_uid","sample_name"))
+div_long <- df %>%
+  tidyr::pivot_longer(all_of(div_cols), names_to = "DIV", values_to = "rel_abund") %>%
+  dplyr::filter(is.finite(rel_abund)) 
+
+# Rescale if 0–100
+row_tot <- div_long %>% group_by(sample_name) %>% summarise(t = sum(rel_abund), .groups="drop")
+if (mean(row_tot$t, na.rm = TRUE) > 90 && mean(row_tot$t, na.rm = TRUE) < 110) {
+  div_long <- div_long %>% mutate(rel_abund = rel_abund / 100)
+}
+
+# 2) Attach Site/Zone
+div_long <- div_long %>%
+  mutate(Site = site_from_sample(sample_name)) %>%
+  left_join(site2zone, by = "Site") %>%
+  mutate(Zone = dplyr::coalesce(Zone, "Unknown"))
+
+# --- Top-N DIVs (include D1 no matter what) ---
+# --- keep D1 and choose Top-N as before ---
+topN <- 25
+div_totals <- plot_df %>%
+  group_by(DIV) %>% summarise(total = sum(rel_abund), .groups = "drop")
+
+top_divs_base <- div_totals %>%
+  arrange(desc(total)) %>%
+  slice(1:min(topN, n())) %>%
+  pull(DIV)
+
+top_divs <- unique(c("D1", top_divs_base))  # always keep D1
+
+plot_df <- plot_df %>%
+  mutate(DIV_plot = ifelse(DIV %in% top_divs, DIV, "Other"))
+
+# --- legend order (for legend only): abundant desc, 'Other' last ---
+legend_levels <- plot_df %>%
+  group_by(DIV_plot) %>% summarise(total = sum(rel_abund), .groups = "drop") %>%
+  arrange(desc(total)) %>% pull(DIV_plot)
+legend_levels <- c(setdiff(legend_levels, "Other"), "Other")
+
+# --- STACK order (for bars): most abundant first, 'Other' LAST (so it's on TOP)
+stack_levels <- legend_levels  # abundant desc with 'Other' last
+plot_df$DIV_plot <- factor(plot_df$DIV_plot, levels = stack_levels)
+
+# --- geom_bar: remove reverse stacking ---
+p_divs <- ggplot(plot_df, aes(x = sample_name_ord, y = rel_abund, fill = DIV_plot)) +
+  geom_bar(stat = "identity",
+           color = "black", linewidth = 0.1, width = 0.85) +   # <-- no position_stack(reverse=TRUE)
+  scale_fill_manual(values = div_palette,
+                    breaks = legend_levels,                 # legend order (Other last)
+                    name = "ITS2 DIV") 
+
+# --- Palette (make sure D1 has its own colour) ---
+base_cols <- c(
+  "C1"    = "#eee54f",
+  "C1b"   = "#eee54f",
+  "C1c"   = "#F4C430",
+  "C1q"   = "#F4C430",
+  "C3"    = "#498880",
+  "C3v"   = "#1596a3",
+  "C1n"   = "#31ceb6",
+  "C42.2" = "#65a35c",
+  "D1"    = "#82FFC7",
+  "Other" = "grey80"
+)
+need <- setdiff(legend_levels, names(base_cols))
+if (length(need)) {
+  auto <- scales::hue_pal()(length(need)); names(auto) <- need
+  div_palette <- c(base_cols, auto)
+} else div_palette <- base_cols
+# keep only colours actually used in legend
+div_palette <- div_palette[legend_levels]
+
+# --- Plot: position_stack(reverse=TRUE) puts first level on TOP of stack ---
+p_divs <- ggplot(plot_df, aes(x = sample_name_ord, y = rel_abund, fill = DIV_plot)) +
+  geom_bar(stat = "identity",
+           color = "black", linewidth = 0.1, width = 0.85,
+           position = position_stack(reverse = TRUE)) +  # <-- key line
+  scale_fill_manual(values = div_palette,
+                    breaks = legend_levels,             # legend order (Other last)
+                    name = "ITS2 DIV") +
+  scale_x_discrete(breaks = levels(plot_df$sample_name_ord), labels = lab_map) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = legend_x, y = "Relative Abundance (%)", title = "") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x   = ggtext::element_markdown(size = 16, angle = 45, hjust = 1),
+    axis.title.x  = ggtext::element_markdown(size = 16, margin = margin(t = 8), lineheight = 1.1),
+    plot.title.position = "plot",
+    axis.ticks    = element_line(color = "grey70", linewidth = 0.4),
+    axis.ticks.length.x = unit(2, "pt"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.title  = element_text(family = "sans", size = 16, face = "bold"),
+    legend.text   = element_text(family = "sans", size = 14),
+    legend.background = element_rect(fill = "white", color = NA)
+  ) +
+  guides(fill = guide_legend(title.position = "top", byrow = TRUE,
+                             nrow = ceiling(length(legend_levels)/8)))
+
+print(p_divs)
+
+##############################################
+## ITS2 DIV stacked barplot (NCs INCLUDED) ##
+## - uses wide df: sample_uid, sample_name, DIV columns
+## - keeps NCs as normal bars (Zone = "NC")
+## - orders samples: North → South → Unknown → NC, then Site → sample
+## - keeps D1 in the legend; "Other" stacks on TOP
+##############################################
+
+div_csv_fp <- file.path(sp_root, "analyses", analysis_id,
+                        "pre_med_seqs", "pre_med_relative_abundance_df.csv")
+df_div_raw <- readr::read_csv(div_csv_fp, show_col_types = FALSE)
+
+sum(grepl("(?i)nc$", df_div_raw$sample_name))         # how many NCs?
+unique(df_div_raw$sample_name[grepl("(?i)nc$", df_div_raw$sample_name)])
+
+##############################################
+## ITS2 DIV stacked barplot (NCs INCLUDED) ##
+##############################################
+suppressPackageStartupMessages({
+  library(dplyr); library(tidyr); library(forcats)
+  library(ggplot2); library(ggtext); library(scales); library(stringr)
+})
+
+# 0) Load FRESH (don’t reuse a previously filtered df)
+div_csv_fp <- file.path(sp_root, "analyses", analysis_id,
+                        "pre_med_seqs", "pre_med_relative_abundance_df.csv")
+stopifnot(file.exists(div_csv_fp))
+df <- readr::read_csv(div_csv_fp, show_col_types = FALSE)
+
+# 1) Long format (do NOT drop NCs)
+stopifnot(all(c("sample_uid","sample_name") %in% names(df)))
+div_cols <- setdiff(names(df), c("sample_uid","sample_name"))
+long_all <- df %>%
+  pivot_longer(all_of(div_cols), names_to = "DIV", values_to = "rel_abund") %>%
+  filter(is.finite(rel_abund))
+
+# 2) Rescale if table is in 0–100
+row_tot <- long_all %>% group_by(sample_name) %>% summarise(t = sum(rel_abund), .groups="drop")
+if (mean(row_tot$t, na.rm = TRUE) > 90 && mean(row_tot$t, na.rm = TRUE) < 110) {
+  long_all <- long_all %>% mutate(rel_abund = rel_abund / 100)
+}
+
+# 3) Helpers (create if missing)
+if (!exists("site_from_sample")) {
+  site_from_sample <- function(x){
+    x %>% tolower() %>% str_replace("(nc)$","") %>%
+      str_extract("^[a-z]+(?:-[a-z]+)?") %>% tidyr::replace_na("unknown")
+  }
+}
+if (!exists("site2zone")) {
+  site2zone <- tibble::tibble(
+    Site = c("ada","bis","oku","mak","miz","res-mak","res-miz","res-sun"),
+    Zone = c("North","North","North","South","South","South","South","South")
+  )
+}
+
+# 4) Annotate Site/Zone + NC flag (without removing NCs)
+long_all <- long_all %>%
+  mutate(IsNC = grepl("(?i)nc$", sample_name),
+         Site = site_from_sample(sample_name)) %>%
+  left_join(site2zone, by = "Site") %>%
+  mutate(Zone = dplyr::coalesce(Zone, "Unknown"),
+         Zone = dplyr::if_else(IsNC, "NC", Zone))
+
+# 5) Top-N DIVs (force-keep D1); others -> "Other"
+topN <- 25
+top_divs <- long_all %>%
+  group_by(DIV) %>% summarise(total = sum(rel_abund), .groups = "drop") %>%
+  arrange(desc(total)) %>% slice(1:min(topN, n())) %>% pull(DIV)
+top_divs <- unique(c("D1", top_divs))  # ensure D1 stays named
+
+plot_df <- long_all %>%
+  mutate(DIV_plot = if_else(DIV %in% top_divs, DIV, "Other"),
+         Zone = fct_explicit_na(Zone, "Unknown"),
+         Zone = factor(Zone, levels = c("North","South","Unknown","NC"))) %>%
+  arrange(Zone, Site, sample_name) %>%
+  group_by(Zone, Site) %>%
+  arrange(Zone, Site, sample_name, .by_group = TRUE) %>%
+  ungroup() %>%
+  mutate(sample_name_ord = factor(sample_name, levels = unique(sample_name)))
+
+# 6) Stack order: abundant bottom, “Other” on TOP (last level)
+legend_levels <- plot_df %>%
+  group_by(DIV_plot) %>% summarise(total = sum(rel_abund), .groups="drop") %>%
+  arrange(desc(total)) %>% pull(DIV_plot)
+legend_levels <- c(setdiff(legend_levels, "Other"), "Other")
+plot_df$DIV_plot <- factor(plot_df$DIV_plot, levels = legend_levels)
+
+# 7) X-labels colored by Zone (NC = dark grey)
+zone_cols <- c(North="#7F96FF", South="#FF7518", Unknown="#666666", NC="#222222")
+lab_map <- plot_df %>%
+  distinct(sample_name_ord, Zone) %>%
+  mutate(sample_name_chr = as.character(sample_name_ord),
+         zn = as.character(Zone),
+         label = sprintf("<span style='color:%s'>%s</span>", zone_cols[zn], sample_name_chr)) %>%
+  { setNames(.$label, .$sample_name_chr) }
+
+# 8) Palette (yours + auto for remaining)
+base_cols <- c(
+  "C1"="#eee54f","C1b"="#eee54f","C1c"="#F4C430","C1q"="#F4C430",
+  "C3"="#498880","C3v"="#1596a3","C1n"="#1596a3","C42.2"="#65a35c",
+  "D1"="#82FFC7","Other"="grey80"
+)
+need <- setdiff(legend_levels, names(base_cols))
+div_palette <- if (length(need)) { auto <- scales::hue_pal()(length(need)); names(auto) <- need; c(base_cols, auto) } else base_cols
+div_palette <- div_palette[legend_levels]
+
+# 9) Inline zone legend text
+present_zones <- intersect(unique(as.character(plot_df$Zone)), names(zone_cols))
+legend_bits <- sprintf("<span style='color:%s'><b>%s</b></span>", zone_cols[present_zones], present_zones)
+legend_x <- paste0("<span style='color:#000; font-weight:400;'>Samples</span><br>",
+                   paste(legend_bits, collapse = " &nbsp;&bull;&nbsp; "))
+
+# Find x-positions of NC samples
+nc_idx <- which(levels(plot_df$sample_name_ord) %in%
+                  plot_df$sample_name[plot_df$Zone == "NC"])
+if (length(nc_idx) > 0) {
+  xmin <- min(nc_idx) - 0.5
+  xmax <- max(nc_idx) + 0.5
+} else {
+  xmin <- xmax <- NULL
+}
+
+# Base plot with rectangle highlight for NCs
+p_DIVs_including_NC <- ggplot(plot_df, aes(sample_name_ord, rel_abund, fill = DIV_plot)) +
+  # draw rectangle *behind* bars
+  { if (!is.null(xmin)) annotate("rect",
+                                 xmin = xmin, xmax = xmax,
+                                 ymin = -0.01, ymax = 1.01,
+                                 color = "black", fill = NA, linewidth = 0.5) } +
+  geom_bar(stat="identity", color="black", linewidth=0.1, width=0.85) +
+  scale_fill_manual(values = div_palette, breaks = legend_levels, name = "ITS2 DIV") +
+  scale_x_discrete(labels = lab_map) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(x = legend_x, y = "Relative Abundance (%)", title = "") +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.text.x   = ggtext::element_markdown(size=16, angle=45, hjust=1),
+    axis.title.x  = ggtext::element_markdown(size=16, margin=margin(t=8), lineheight=1.1),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.title = element_text(size=16, face="bold"),
+    legend.text  = element_text(size=14),
+    legend.background = element_rect(fill="white", color=NA)
+  ) +
+  guides(fill = guide_legend(title.position="top", byrow=TRUE,
+                             nrow = ceiling(length(legend_levels)/8)))
+
+print(p_DIVs_including_NC)
+
+# 11) Save
+if (!exists("profiles_dir")) profiles_dir <- getwd()
+ggsave(file.path(profiles_dir, "gg_DIVs_relative_with_NCs.png"),
+       p_DIVs_including_NC, width = 16, height = 10, dpi = 300)
+ggsave(file.path(profiles_dir, "gg_DIVs_relative_with_NCs.pdf"),
+       p_DIVs_including_NC, width = 16, height = 10, device = cairo_pdf)
+
+## =======================
+## NC vs non-NC statistics
+## =======================
+suppressPackageStartupMessages({library(dplyr); library(tidyr); library(vegan)})
+
+## 1) Collapse duplicates: sum rel_abund per sample × DIV_plot
+mat_df <- plot_df %>%
+  dplyr::group_by(sample_name_ord, DIV_plot) %>%
+  dplyr::summarise(rel_abund = sum(rel_abund, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(
+    names_from  = DIV_plot,
+    values_from = rel_abund,
+    values_fill = 0
+  )
+
+## 2) Rownames + numeric matrix
+mat <- as.data.frame(mat_df)
+rownames(mat) <- as.character(mat$sample_name_ord)
+mat$sample_name_ord <- NULL
+# coerce all columns to numeric (guards against list/char cols)
+mat[] <- lapply(mat, function(x) as.numeric(as.character(x)))
+mat[is.na(mat)] <- 0
+
+## 3) Metadata (match row order)
+meta_nc <- plot_df %>%
+  dplyr::distinct(sample_name_ord, IsNC, Zone) %>%
+  dplyr::mutate(sample_name_ord = as.character(sample_name_ord)) %>%
+  dplyr::filter(sample_name_ord %in% rownames(mat)) %>%
+  dplyr::arrange(match(sample_name_ord, rownames(mat)))
+
+stopifnot(nrow(meta_nc) == nrow(mat))
+
+## 4) Bray–Curtis + tests
+bc <- vegan::vegdist(as.matrix(mat), method = "bray")
+
+set.seed(123)
+perm_nc <- vegan::adonis2(bc ~ IsNC, data = meta_nc, permutations = 999)
+bd       <- vegan::betadisper(bc, meta_nc$IsNC)
+bd_anova <- anova(bd)
+bd_perm  <- permutest(bd, permutations = 999)
+
+print(perm_nc)
+print(bd_anova)
+print(bd_perm)
+
+## 5) Quick result lines for your Results section
+R2     <- if ("R2" %in% colnames(perm_nc)) perm_nc$R2[1] else perm_nc$`R2`[1]
+p_perm <- perm_nc$`Pr(>F)`[1]
+F_bd   <- as.numeric(bd_perm$tab[1, "F"])
+p_bd   <- as.numeric(bd_perm$tab[1, "Pr(>F)"])
+
+cat(sprintf("\nPERMANOVA (Bray–Curtis): NC vs non-NC -> R² = %.3f, p = %.3f\n", R2, p_perm))
+cat(sprintf("PERMDISP: F = %.3f, p = %.3f (group dispersions %s)\n",
+            F_bd, p_bd, ifelse(p_bd < 0.05, "differ", "do not differ")))
+
+#######################################################################
+## =======================
+## NMDS on ITS2 DIV stacks
+## =======================
+suppressPackageStartupMessages({
+  library(dplyr); library(ggplot2); library(vegan); library(ggtext)
+})
+
+# 0) Guard: drop zero-variance columns (constant 0 across all samples)
+keep_cols <- which(apply(mat, 2, function(x) sd(x, na.rm = TRUE) > 0))
+mat_keep  <- as.matrix(mat[, keep_cols, drop = FALSE])
+
+# 1) Hellinger transform (recommended for community data with many zeros)
+#    Then NMDS with Bray-Curtis on the transformed data.
+mat_hell <- vegan::decostand(mat_keep, method = "hellinger")
+
+set.seed(123)
+nmds <- vegan::metaMDS(
+  mat_hell,
+  distance       = "bray",
+  k              = 2,
+  trymax         = 200,
+  autotransform  = FALSE,
+  noshare        = FALSE,
+  trace          = FALSE
+)
+
+# 2) Scores + metadata
+scr <- as.data.frame(vegan::scores(nmds, display = "sites"))
+scr$sample_name_ord <- rownames(scr)
+
+plot_meta <- meta_nc %>%
+  mutate(sample_name_ord = as.character(sample_name_ord)) %>%
+  inner_join(scr, by = "sample_name_ord")
+
+# 3) Colors to match your barplot legend
+zone_cols <- c(North="#7F96FF", South="#FF7518", NC="#222222")
+
+# 4) Ellipse helper (skip groups with < 3 samples to avoid warnings)
+eligible_groups <- plot_meta %>%
+  count(Zone) %>% filter(n >= 3) %>% pull(Zone)
+
+# 5) NMDS plot
+p_NMDS <- ggplot(plot_meta, aes(x = NMDS1, y = NMDS2, color = Zone)) +
+  # group ellipses (only if enough points)
+  { if (length(eligible_groups)) 
+    ggplot2::stat_ellipse(aes(group = Zone),
+                          data = dplyr::filter(plot_meta, Zone %in% eligible_groups),
+                          type = "t", linewidth = 0.6, alpha = 0.25) 
+    else NULL } +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = zone_cols, drop = FALSE) +
+  coord_equal() +
+  labs(
+    title = "",
+    subtitle = sprintf("", nmds$stress),
+    x = "NMDS1 (Bray-Curtis)", y = "NMDS2 (Bray-Curtis)", color = "Group"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+print(p_NMDS)
+
+
+# Export NMDS plot
+if (!exists("profiles_dir")) profiles_dir <- getwd()
+
+ggsave(file.path(profiles_dir, "NMDS_DIVs_by_Zone.png"),
+       p_NMDS, width = 9, height = 7, dpi = 300)
+
+ggsave(file.path(profiles_dir, "NMDS_DIVs_by_Zone.pdf"),
+       p_NMDS, width = 9, height = 7, device = cairo_pdf)
+
+
+###
+
+
+
+# 7) Save
+if (!exists("profiles_dir")) profiles_dir <- getwd()
+ggsave(file.path(profiles_dir, "NMDS_DIVs_by_Zone.png"),
+       p_NMDS, width = 9, height = 7, dpi = 300)
+ggsave(file.path(profiles_dir, "NMDS_DIVs_by_Zone.pdf"),
+       p_NMDS, width = 9, height = 7, device = cairo_pdf)
+
+# 8) Quick PERMANOVA on the exact same matrix used for NMDS (for convenience)
+bc_hell <- vegan::vegdist(mat_hell, method = "bray")
+set.seed(123)
+adon <- vegan::adonis2(bc_hell ~ Zone, data = plot_meta, permutations = 999)
+print(adon)
+cat(sprintf("\nPERMANOVA (Bray–Curtis, Hellinger): Zone effect R² = %.3f, p = %.4f\n",
+            adon$R2[1], adon$`Pr(>F)`[1]))
+
+##############################################################
+###########################################################################
+## ITS2 beta-diversity using semicolon-delimited metadata
+## - reads relative abund (rows = sample_uid)
+## - maps to sample_name via absolute+meta
+## - reads metadata (";")
+## - filters NegCtrl, aligns, runs Bray–Curtis / PERMANOVA / PERMDISP
+###########################################################################
+
+need <- c("vegan","readr","dplyr","tibble")
+to_install <- setdiff(need, rownames(installed.packages()))
+if (length(to_install)) install.packages(to_install, dependencies = TRUE)
+library(vegan); library(readr); library(dplyr); library(tibble)
+
+# --- Paths (EDIT if different) ---
+rel_fp      <- "/Users/luki/Downloads/output/analyses/20250901T132441/its2_type_profiles/5_20250901_Lukas_Palythoa_analysis_20250901T132441.profiles.relative.abund_only.txt"
+abs_meta_fp <- "/Users/luki/Downloads/output/analyses/20250901T132441/its2_type_profiles/5_20250901_Lukas_Palythoa_analysis_20250901T132441.profiles.absolute.abund_and_meta.txt"
+meta_fp     <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/ITS2_stats_metadata.csv"
+
+stopifnot(file.exists(rel_fp), file.exists(abs_meta_fp), file.exists(meta_fp))
+
+# --- 1) Read RELATIVE table (rows = sample_uid, cols = profile UIDs) ---
+rel <- read_tsv(rel_fp, col_types = cols()) |> as.data.frame()
+rownames(rel) <- rel[[1]]; rel[[1]] <- NULL   # rownames are sample_uid (as strings)
+
+# --- 2) Map sample_uid -> sample_name from absolute+meta (col1, col2) ---
+abs_meta <- read_tsv(abs_meta_fp, col_types = cols(.default = col_guess()))
+uid2name <- setNames(abs_meta[[2]], as.character(abs_meta[[1]]))
+missing  <- setdiff(rownames(rel), names(uid2name))
+if (length(missing)) stop("Missing sample_uid in mapping: ", paste(missing, collapse = ", "))
+rownames(rel) <- uid2name[rownames(rel)]   # now rownames are sample_name
+
+# --- 3) Read your metadata (semicolon-delimited) ---
+meta <- read_delim(meta_fp, delim = ";", show_col_types = FALSE)
+
+# Normalize NegCtrl to logical if needed
+if (!is.logical(meta$NegCtrl)) {
+  meta <- meta |>
+    mutate(NegCtrl = case_when(
+      tolower(as.character(NegCtrl)) %in% c("true","t","1")  ~ TRUE,
+      tolower(as.character(NegCtrl)) %in% c("false","f","0") ~ FALSE,
+      TRUE ~ NA
+    ))
+}
+
+# Ensure required columns
+stopifnot(all(c("sample_name","Site","Zone","NegCtrl") %in% names(meta)))
+
+# --- 4) Filter out negative controls (recommended for stats) ---
+meta <- meta |> filter(!NegCtrl)
+
+# --- 5) Align abundance rows to metadata sample_name ---
+common <- intersect(rownames(rel), meta$sample_name)
+if (!length(common)) stop("No overlapping sample names between abundance and metadata after NC filter.")
+abund <- rel[common, , drop = FALSE]
+meta  <- meta[match(common, meta$sample_name), , drop = FALSE]
+
+# Avoid tibble rowname warning
+meta  <- as.data.frame(meta)
+rownames(meta) <- meta$sample_name
+
+# Optional safety: remove zero-sum rows/cols
+if (any(rowSums(abund) == 0)) abund <- abund[rowSums(abund) > 0, , drop = FALSE]
+if (any(colSums(abund) == 0)) abund <- abund[, colSums(abund) > 0, drop = FALSE]
+
+# Coerce factors
+meta$Zone <- factor(meta$Zone, levels = unique(meta$Zone))
+meta$Site <- factor(meta$Site)
+
+# --- 6) Bray–Curtis, PERMANOVA, PERMDISP ---
+bc <- vegdist(as.matrix(abund), method = "bray")
+
+set.seed(123)
+perm <- adonis2(bc ~ Zone, data = meta, permutations = 999)
+
+bd <- betadisper(bc, meta$Zone)
+bd_anova <- anova(bd)
+bd_perm  <- permutest(bd, permutations = 999)
+
+# --- 7) Export TSVs (no broom::tidy -> no warnings) ---
+# Force numeric values to 3 significant digits
+perm_tab <- rownames_to_column(as.data.frame(perm), var = "term") %>%
+  mutate(across(where(is.numeric), ~ signif(., 3)))
+
+bd_a_tab <- rownames_to_column(as.data.frame(bd_anova), var = "term") %>%
+  mutate(across(where(is.numeric), ~ signif(., 3)))
+
+bd_p_tab <- tibble(
+  Test = "PERMDISP",
+  F = signif(as.numeric(bd_perm$tab[1, "F"]), 3),
+  Df = bd_perm$df[1],
+  Permutations = bd_perm$permutations,
+  `Pr(>F)` = signif(as.numeric(bd_perm$tab[1, "Pr(>F)"]), 3)
+)
+
+write_csv(perm_tab, "ITS2_PERMANOVA.csv")
+write_csv(bd_a_tab, "ITS2_PERMDISP_ANOVA.csv")
+write_csv(bd_p_tab, "ITS2_PERMDISP_permutest.csv")
+
+
+
+perm <- adonis2(bc ~ Zone, data = meta, permutations = 999)
+perm
+
+perm_tab <- rownames_to_column(as.data.frame(perm), var = "term")
+
+
+# List versions of your key packages
+packageVersion("vegan")
+packageVersion("phyloseq")
+packageVersion("indicspecies")
+packageVersion("ggplot2")
+
+
+
+########################################
+
+
+library(readr)
+library(dplyr)
+
+# Path to your absolute abundance file
+abs_fp <- "/Users/luki/Downloads/output/analyses/20250901T132441/its2_type_profiles/5_20250901_Lukas_Palythoa_analysis_20250901T132441.profiles.absolute.abund_only.txt"
+
+# Read table (rows = profiles, cols = samples)
+abs_tab <- read_tsv(abs_fp, col_types = cols())
+first_col <- names(abs_tab)[1]   # profile UID column
+rownames(abs_tab) <- abs_tab[[first_col]]
+abs_tab[[first_col]] <- NULL
+
+# Convert to matrix
+mat <- as.matrix(abs_tab)
+
+# ---- Total reads (absolute counts) ----
+total_reads <- sum(mat)
+
+# ---- Reads per sample ----
+reads_per_sample <- colSums(mat)
+reads_summary <- summary(reads_per_sample)
+
+# ---- Number of unique DIVs ----
+total_DIVs <- nrow(mat)
+
+# ---- DIV richness per sample (profiles with >0 counts) ----
+divs_per_sample <- colSums(mat > 0)
+divs_summary <- summary(divs_per_sample)
+
+# ---- Combine into a results-friendly table ----
+sample_summary <- data.frame(
+  Sample = names(reads_per_sample),
+  Reads  = reads_per_sample,
+  DIVs   = divs_per_sample
+)
+
+# Export if needed
+write_csv(sample_summary, "ITS2_sample_summary.csv")
+
+# Print results
+cat("Total reads across all samples:", total_reads, "\n")
+cat("Total unique DIVs:", total_DIVs, "\n\n")
+
+cat("Reads per sample (summary):\n")
+print(reads_summary)
+
+cat("\nDIVs per sample (summary):\n")
+print(divs_summary)
+
+
+
+#####################################
+# Load libraries
+library(readr)
+library(dplyr)
+library(stringr)
+
+# Path to your profiles file
+profiles_fp <- "/Users/luki/Downloads/output/analyses/20250901T132441/its2_type_profiles/5_20250901_Lukas_Palythoa_analysis_20250901T132441.profiles.relative.abund_and_meta.txt"
+
+# Read in the file (skip the metadata header rows)
+profiles <- read_tsv(profiles_fp, skip = 6)
+
+# Rename first two columns
+colnames(profiles)[1:2] <- c("sample_uid", "sample_name")
+
+# Keep only real samples (exclude NCs)
+profiles_real <- profiles %>%
+  filter(!str_detect(sample_name, regex("NC", ignore_case = TRUE)))
+
+# Get only the profile columns (all except first two)
+profile_cols <- setdiff(names(profiles_real), c("sample_uid", "sample_name"))
+
+# Convert to numeric just in case
+profiles_real[profile_cols] <- lapply(profiles_real[profile_cols], as.numeric)
+
+# Sum relative abundances for each profile
+profile_sums <- colSums(profiles_real[profile_cols], na.rm = TRUE)
+
+# Total across all profiles
+total <- sum(profile_sums)
+
+# Percentage for each profile
+profile_percentages <- 100 * profile_sums / total
+
+# Percentage for all C-type profiles
+c_type_percentage <- 100 * sum(profile_sums[str_starts(names(profile_sums), "C")]) / total
+
+# Print results
+cat("Total C-type profiles: ", round(c_type_percentage, 2), "%\n\n")
+
+profile_percentages %>%
+  sort(decreasing = TRUE) %>%
+  round(2)
+
+
+
+
+##############################################################
+## Bray–Curtis PERMANOVA & PERMDISP on DIVs (NCs excluded)  ##
+##############################################################
+
+suppressPackageStartupMessages({library(vegan); library(dplyr); library(tibble)})
+
+# 1) Filter out NCs
+div_noNC <- plot_df %>%
+  filter(Zone %in% c("North","South"))
+
+# 2) Wide matrix: sample × DIV (relative abundance)
+mat_df <- div_noNC %>%
+  group_by(sample_name_ord, DIV_plot) %>%
+  summarise(rel_abund = sum(rel_abund, na.rm = TRUE), .groups = "drop") %>%
+  tidyr::pivot_wider(names_from = DIV_plot, values_from = rel_abund, values_fill = 0)
+
+mat <- as.data.frame(mat_df)
+rownames(mat) <- as.character(mat$sample_name_ord)
+mat$sample_name_ord <- NULL
+mat[] <- lapply(mat, as.numeric)
+mat[is.na(mat)] <- 0
+
+# 3) Metadata (Zone only, aligned to rows of mat)
+meta <- div_noNC %>%
+  distinct(sample_name_ord, Zone) %>%
+  filter(sample_name_ord %in% rownames(mat)) %>%
+  arrange(match(sample_name_ord, rownames(mat)))
+
+stopifnot(nrow(meta) == nrow(mat))
+rownames(meta) <- meta$sample_name_ord
+
+# 4) Bray–Curtis distance
+bc <- vegdist(as.matrix(mat), method = "bray")
+
+# 5) PERMANOVA
+set.seed(123)
+perm <- adonis2(bc ~ Zone, data = meta, permutations = 999)
+
+# 6) PERMDISP (test for dispersion differences)
+bd <- betadisper(bc, meta$Zone)
+bd_anova <- anova(bd)
+bd_perm  <- permutest(bd, permutations = 999)
+
+# 7) Print results
+print(perm)
+print(bd_anova)
+print(bd_perm)
+
+# 8) Extract nice summary lines
+R2     <- signif(perm$R2[1], 3)
+F_perm <- signif(perm$F[1], 3)
+p_perm <- signif(perm$`Pr(>F)`[1], 3)
+
+F_bd   <- signif(bd_perm$tab[1, "F"], 3)
+p_bd   <- signif(bd_perm$tab[1, "Pr(>F)"], 3)
+
+cat(sprintf("\nPERMANOVA (Bray–Curtis on DIVs): F = %.3f, R² = %.3f, p = %.3f\n", F_perm, R2, p_perm))
+cat(sprintf("PERMDISP: F = %.3f, p = %.3f (group dispersions %s)\n",
+            F_bd, p_bd, ifelse(p_bd < 0.05, "differ", "do not differ")))
+
