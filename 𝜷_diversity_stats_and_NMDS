@@ -1,0 +1,445 @@
+##################################################
+##############        STATS        ###############
+##################################################
+
+# R VERSION: 4.5.0
+# LUKAS PIRKNER
+# 11/08/2025
+
+############################################################
+# 3.beta_diversity_stats_BrayOnly.R
+# Minimal Bray–Curtis beta-diversity analysis
+# Lukas Pirkner – Master’s Thesis
+############################################################
+# 3.beta_diversity_stats_BrayOnly.R
+
+
+suppressPackageStartupMessages({
+  library(phyloseq); library(vegan); library(ggplot2)
+})
+
+# Settings
+markers    <- c("16S","ITS2")  # will skip missing
+base_dir   <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis"
+res_dir    <- file.path(base_dir, "4.results")
+fig_dir    <- file.path(res_dir, "figures", "beta"); dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+stats_dir  <- file.path(res_dir, "stats")
+summary_dir<- file.path(stats_dir, "summary"); dir.create(summary_dir, recursive = TRUE, showWarnings = FALSE)
+
+summary_df <- data.frame(Marker=character(), Term_Bray=character(),
+                         R2_Bray=numeric(), P_Bray=numeric(),
+                         Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+                         stringsAsFactors = FALSE)
+
+# Auto-detect markers present in 4.results
+rds <- list.files(res_dir, pattern="^phyloseq_cleaned_no_contaminants_.*\\.rds$", full.names=FALSE)
+markers <- sub("^phyloseq_cleaned_no_contaminants_(.*)\\.rds$", "\\1", rds)
+markers <- intersect(markers, c("16S","ITS2"))  # keep known ones only
+cat("Detected markers:", paste(markers, collapse=", "), "\n")
+
+# Collect site-level stats (all sites, NC removed)
+site_summary_df <- data.frame(
+  Marker=character(), Term_Bray=character(),
+  R2_Bray=numeric(), P_Bray=numeric(),
+  Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Collect site-level stats (filtered ≥ 3 reps, NC removed)
+site_summary_df_filtered <- data.frame(
+  Marker=character(), Term_Bray=character(),
+  R2_Bray=numeric(), P_Bray=numeric(),
+  Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+# Strong colors per site (define once)
+site_colors <- c(
+  "Ginowan"     = "#FF7518",  
+  "Makiminato"  = "#FB607F",  
+  "Mizugama"    = "#F4C430",
+  "Sunabe"      = "#BCBD22",
+  "Bisezaki"    = "#7F96FF",
+  "Oku beach"   = "#6A43C7",  
+  "Adan beach"  = "#65DEF1",  
+  "South_site"  = "#BCBD22"   
+)
+
+
+
+# Prepare separate tables
+summary_df <- data.frame(
+  Marker=character(), Term_Bray=character(),
+  R2_Bray=numeric(), P_Bray=numeric(),
+  Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+  stringsAsFactors = FALSE
+)
+
+site_summary_df <- data.frame(
+  Marker=character(), Term_Bray=character(),
+  R2_Bray=numeric(), P_Bray=numeric(),
+  Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+  stringsAsFactors = FALSE
+)
+
+site_summary_df_filtered <- data.frame(
+  Marker=character(), Term_Bray=character(),
+  R2_Bray=numeric(), P_Bray=numeric(),
+  Disp_ANOVA_Bray=numeric(), Disp_Perm_Bray=numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (m in markers){
+  cat("\n=== Processing marker:", m, "===\n")
+  ps_file <- file.path(res_dir, paste0("phyloseq_cleaned_no_contaminants_", m, ".rds"))
+  if (!file.exists(ps_file)){ cat("  (skip) not found:", ps_file, "\n"); next }
+  
+  ps <- readRDS(ps_file)
+  
+  # Remove negative controls
+  keep_no_nc <- !grepl("NC", sample_names(ps), ignore.case = TRUE)
+  ps <- prune_samples(keep_no_nc, ps)
+  cat(sprintf("  Removed %d negative controls for marker %s\n",
+              sum(!keep_no_nc), m))
+  
+  # Zone stats =======================================================
+  sd <- as(sample_data(ps), "data.frame")
+  if (!"Zone" %in% names(sd)) stop(sprintf("[%s] 'Zone' not found.", m))
+  
+  keep <- !is.na(sd$Zone)
+  ps   <- prune_samples(keep, ps)
+  sd   <- as(sample_data(ps), "data.frame")
+  sd$Zone <- droplevels(factor(sd$Zone, levels = c("North","South")))
+  
+  if (length(table(sd$Zone)) >= 2) {
+    bc <- phyloseq::distance(ps, method = "bray")
+    labs <- labels(bc); sd <- sd[labs, , drop = FALSE]
+    
+    adon <- vegan::adonis2(as.matrix(bc) ~ Zone, data = sd)
+    R2_val <- adon$R2[1]; P_val <- adon$`Pr(>F)`[1]
+    
+    bd <- vegan::betadisper(bc, group = sd$Zone)
+    disp_anova_p <- anova(bd)$`Pr(>F)`[1]
+    disp_perm_p  <- permutest(bd)$tab$`Pr(>F)`[1]
+    
+    summary_df <- rbind(summary_df, data.frame(
+      Marker=m, Term_Bray="Zone",
+      R2_Bray=R2_val, P_Bray=P_val,
+      Disp_ANOVA_Bray=disp_anova_p, Disp_Perm_Bray=disp_perm_p
+    ))
+  }
+  
+  # Site stats =======================================================
+  sd_all <- as(sample_data(ps), "data.frame")
+  site_col <- if ("Site_fromPrefix" %in% names(sd_all)) {
+    "Site_fromPrefix"
+  } else if ("Site" %in% names(sd_all)) {
+    "Site"
+  } else {
+    NA_character_
+  }
+  
+  if (!is.na(site_col)) {
+    keep_site_full <- !is.na(sd_all[[site_col]])
+    ps_site_full   <- prune_samples(keep_site_full, ps)
+    sd_site_full   <- as(sample_data(ps_site_full), "data.frame")
+    sd_site_full[[site_col]] <- droplevels(factor(sd_site_full[[site_col]]))
+    
+    # --- Site (all) ---
+    if (length(levels(sd_site_full[[site_col]])) >= 2) {
+      bc_site_full <- phyloseq::distance(ps_site_full, method = "bray")
+      labs <- labels(bc_site_full)
+      sd_site_full <- sd_site_full[labs, , drop = FALSE]
+      
+      adon_site <- vegan::adonis2(as.matrix(bc_site_full) ~ sd_site_full[[site_col]])
+      R2_site <- adon_site$R2[1]; P_site <- adon_site$`Pr(>F)`[1]
+      
+      bd_site <- vegan::betadisper(bc_site_full, group = sd_site_full[[site_col]])
+      disp_anova_site <- anova(bd_site)$`Pr(>F)`[1]
+      disp_perm_site  <- permutest(bd_site)$tab$`Pr(>F)`[1]
+      
+      site_summary_df <- rbind(site_summary_df, data.frame(
+        Marker = m, Term_Bray = "Site (all)",
+        R2_Bray = R2_site, P_Bray = P_site,
+        Disp_ANOVA_Bray = disp_anova_site, Disp_Perm_Bray = disp_perm_site
+      ))
+    }
+    
+    # --- Site (≥3 reps) ---
+    site_counts <- table(sd_site_full[[site_col]])
+    valid_sites <- names(site_counts[site_counts >= 3])
+    ps_site_f   <- prune_samples(sd_site_full[[site_col]] %in% valid_sites, ps_site_full)
+    sd_site_f   <- as(sample_data(ps_site_f), "data.frame")
+    sd_site_f[[site_col]] <- droplevels(factor(sd_site_f[[site_col]]))
+    
+    if (length(levels(sd_site_f[[site_col]])) >= 2) {
+      bc_site_f <- phyloseq::distance(ps_site_f, method = "bray")
+      labs <- labels(bc_site_f)
+      sd_site_f <- sd_site_f[labs, , drop = FALSE]
+      
+      adon_site_f <- vegan::adonis2(as.matrix(bc_site_f) ~ sd_site_f[[site_col]])
+      R2_site_f <- adon_site_f$R2[1]; P_site_f <- adon_site_f$`Pr(>F)`[1]
+      
+      bd_site_f <- vegan::betadisper(bc_site_f, group = sd_site_f[[site_col]])
+      disp_anova_site_f <- anova(bd_site_f)$`Pr(>F)`[1]
+      disp_perm_site_f  <- permutest(bd_site_f)$tab$`Pr(>F)`[1]
+      
+      site_summary_df_filtered <- rbind(site_summary_df_filtered, data.frame(
+        Marker = m, Term_Bray = "Site (≥3 reps)",
+        R2_Bray = R2_site_f, P_Bray = P_site_f,
+        Disp_ANOVA_Bray = disp_anova_site_f, Disp_Perm_Bray = disp_perm_site_f
+      ))
+    }
+  }
+}
+
+# Save all three
+write.csv(summary_df, file.path(summary_dir, "beta_diversity_summary_Bray.csv"), row.names = FALSE)
+write.csv(site_summary_df, file.path(summary_dir, "beta_diversity_summary_Bray_bySite.csv"), row.names = FALSE)
+write.csv(site_summary_df_filtered, file.path(summary_dir, "beta_diversity_summary_Bray_bySite_filtered.csv"), row.names = FALSE)
+
+
+
+fig_dir <- file.path("/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis/4.results","figures","beta")
+
+
+
+
+
+
+
+#################################################
+################ NMDS (16S only) ################
+#################################################
+
+suppressPackageStartupMessages({
+  library(phyloseq); library(vegan); library(ggplot2); library(dplyr)
+})
+
+# Paths
+base_dir <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis"
+res_dir  <- file.path(base_dir, "4.results")
+fig_dir  <- file.path(res_dir, "figures", "beta"); dir.create(fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Load 16S phyloseq
+ps_file <- file.path(res_dir, "phyloseq_cleaned_no_contaminants_16S.rds")
+stopifnot(file.exists(ps_file))
+ps <- readRDS(ps_file)
+
+# Drop negative controls (sample names containing "NC")
+keep_no_nc <- !grepl("NC", sample_names(ps), ignore.case = TRUE)
+ps <- prune_samples(keep_no_nc, ps)
+
+# Sample metadata
+sd <- as(sample_data(ps), "data.frame")
+
+## Ensure Zone from sample-name prefix (handles res-xxx)
+sd <- as(sample_data(ps), "data.frame")
+sn <- rownames(sd)
+
+# Extract 3-letter site code; if name starts with "res-", use the 3 letters after it
+prefix <- tolower(ifelse(grepl("^res-[A-Za-z]{3}", sn),
+                         sub("^res-([A-Za-z]{3}).*$", "\\1", sn),
+                         sub("^([A-Za-z]{3}).*$", "\\1", sn)))
+
+# Map 3-letter codes to Site
+site_map <- c(
+  gin = "Ginowan",
+  mak = "Makiminato",
+  man = "Makiminato",   # treat 'man' as Makiminato too
+  miz = "Mizugama",
+  sun = "Sunabe",
+  bis = "Bisezaki",
+  oku = "Oku beach",
+  ada = "Adan beach"
+)
+
+sd$Site_fromPrefix <- unname(site_map[prefix])
+
+# Zone mapping by 3-letter codes
+south <- c("gin","mak","man","miz","sun")
+north <- c("bis","oku","ada")
+
+zone_vec <- ifelse(prefix %in% south, "South",
+                   ifelse(prefix %in% north, "North", NA))
+
+sd$Zone <- factor(zone_vec, levels = c("North","South"))
+sample_data(ps) <- sample_data(sd)   # write back
+sd <- as(sample_data(ps), "data.frame")
+
+# Sanity check
+left <- which(is.na(sd$Zone))
+if (length(left)) {
+  message("Unmapped samples (add their 3-letter code to site_map / zone lists):")
+  print(data.frame(sample = rownames(sd)[left], code = prefix[left]), row.names = FALSE)
+}
+
+
+# Keep only samples with known Zone
+keep <- !is.na(sd$Zone)
+if (!all(keep)) {
+  message(sprintf("Dropping %d samples with unknown Zone.", sum(!keep)))
+  ps <- prune_samples(keep, ps)
+  sd <- as(sample_data(ps), "data.frame")
+}
+stopifnot(nrow(sd) == nsamples(ps))
+
+# Build sample × feature matrix
+mat <- as(otu_table(ps), "matrix")
+if (taxa_are_rows(ps)) mat <- t(mat)
+
+# Guard: drop zero-variance features
+keep_cols <- which(apply(mat, 2, function(x) stats::sd(x, na.rm = TRUE) > 0))
+mat_keep  <- as.matrix(mat[, keep_cols, drop = FALSE])
+
+# Hellinger transform, then NMDS (Bray–Curtis)
+set.seed(123)
+mat_hell <- vegan::decostand(mat_keep, method = "hellinger")
+nmds <- vegan::metaMDS(
+  mat_hell,
+  distance      = "bray",
+  k             = 2,
+  trymax        = 200,
+  autotransform = FALSE,
+  noshare       = FALSE,
+  trace         = FALSE
+)
+message(sprintf("NMDS stress: %.3f", nmds$stress))
+
+# Scores + metadata
+scr <- as.data.frame(vegan::scores(nmds, display = "sites"))
+scr$._sample <- rownames(scr)
+sd$._sample  <- rownames(sd)
+plot_meta <- merge(scr, sd, by = "._sample", all.x = TRUE)
+
+# Palette (match your barplots)
+zone_cols <- c(North = "#7F96FF", South = "#FF7518")
+
+# Ellipses only if a group has ≥3 samples
+eligible_groups <- names(which(table(plot_meta$Zone) >= 3))
+
+# Plot
+p_NMDS <- ggplot(plot_meta, aes(x = NMDS1, y = NMDS2, color = Zone)) +
+  { if (length(eligible_groups))
+    ggplot2::stat_ellipse(
+      aes(group = Zone),
+      data = subset(plot_meta, Zone %in% eligible_groups),
+      type = "t", linewidth = 0.6, alpha = 0.25
+    ) else NULL } +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(values = zone_cols, drop = FALSE) +
+  coord_equal() +
+  labs(
+    title = "",
+    subtitle = sprintf("", nmds$stress),
+    x = "NMDS1 (Bray–Curtis)", y = "NMDS2 (Bray–Curtis)", color = "Zone"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.title = element_text(size = 12)   # <-- smaller axis titles
+  )
+
+
+
+
+print(p_NMDS)
+
+# Export
+ggsave(file.path(fig_dir, "NMDS_Bray_16S.pdf"), p_NMDS, width = 8, height = 5.5, device = cairo_pdf)
+ggsave(file.path(fig_dir, "NMDS_Bray_16S.png"), p_NMDS, width = 8, height = 5.5, dpi = 600)
+
+# Quick confirmation
+list.files(fig_dir, pattern = "^NMDS_Bray_16S\\.(pdf|png)$")
+
+#### note: stress is 0.137
+
+
+
+########################################################################
+####### create subsamples of north and run 100 times ##################
+########################################################################
+
+library(phyloseq)
+library(vegan)
+library(dplyr)
+
+set.seed(123)  # reproducibility
+
+# function to do one resample + PERMANOVA
+run_subsample <- function(ps, n_sub = NULL, nperm = 999) {
+  sd <- as(sample_data(ps), "data.frame")
+  
+  # zone IDs
+  north_ids <- rownames(sd)[sd$Zone == "North"]
+  south_ids <- rownames(sd)[sd$Zone == "South"]
+  
+  # smallest group size if not given
+  if (is.null(n_sub)) n_sub <- min(length(north_ids), length(south_ids))
+  
+  # resample
+  north_sub <- sample(north_ids, n_sub)
+  south_sub <- sample(south_ids, n_sub)
+  keep_ids <- c(north_sub, south_sub)
+  
+  ps_sub <- prune_samples(keep_ids, ps)
+  sd_sub <- as(sample_data(ps_sub), "data.frame")
+  
+  # Bray distances
+  bc <- phyloseq::distance(ps_sub, method = "bray")
+  
+  # PERMANOVA
+  ad <- adonis2(as.matrix(bc) ~ Zone, data = sd_sub, permutations = nperm)
+  
+  tibble(R2 = ad$R2[1], p = ad$`Pr(>F)`[1])
+}
+
+# repeat 100 times
+n_runs <- 100
+res <- bind_rows(replicate(n_runs, run_subsample(ps, nperm = 999), simplify = FALSE))
+
+summary(res)
+hist(res$R2, main = "Distribution of R2 from balanced subsamples", xlab = "R2")
+hist(res$p, main = "Distribution of p-values", xlab = "p-value")
+
+mean(res$p < 0.05) * 100
+
+
+library(dplyr)
+library(readr)
+
+# --- summarise repeated subsampling (100 runs) ---
+res_summary <- res %>%
+  summarise(
+    R2_mean = mean(R2),
+    p_mean  = mean(p)
+  )
+
+# --- extract F values from your full run ---
+# assuming you already have:
+# adon_res <- adonis2(as.matrix(bc) ~ Zone, data = sd_sub, permutations = 9999)
+# bd <- betadisper(bc, group = sd_sub$Zone)
+# anova(bd); permutest(bd)
+
+F_permanova <- adon_res$F[1]                    # PERMANOVA F value
+F_permdisp  <- anova(bd)$`F value`[1]           # PERMDISP F value
+p_permdisp  <- permutest(bd, permutations = 9999)$tab$`Pr(>F)`[1]
+
+# --- build final table ---
+summary_tbl <- tibble(
+  Marker     = "16S",
+  Term_Bray  = "Zone (balanced subsampling)",
+  R2_mean    = res_summary$R2_mean,
+  Permanova_F= F_permanova,
+  p_mean     = res_summary$p_mean,
+  Permdisp_F = F_permdisp,
+  Permdisp_P = p_permdisp
+)
+
+# --- write to CSV ---
+write_csv(summary_tbl,
+          file.path(sum_dir, "beta_diversity_summary_Bray_subsampling_stats.csv"))
+
+print(summary_tbl)
