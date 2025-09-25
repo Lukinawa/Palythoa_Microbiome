@@ -1,0 +1,1627 @@
+##################################################################
+################### ANALYSIS FULL DATASET ########################
+##################################################################
+
+
+# R VERSION: 4.5.0
+# LUKAS PIRKNER
+# 06/08/2025
+
+
+# package ShortRead needs to be installed, but not loaded
+required_packages <- c("dada2", "ggplot2", "gridExtra", "readr",
+                       "ggpubr", "stringr", "tidyverse", "scales", "dplyr")
+for (pkg in required_packages) {
+  if (!require(pkg, character.only = TRUE)) {
+    stop(paste("Package", pkg, "is not installed. Please install it before proceeding."))
+  } else {
+    message(pkg, " version: ", packageVersion(pkg))
+  }
+}
+
+
+############################################################
+###   SETUP: Full Analysis Working Directory Structure   ###
+############################################################
+
+
+
+## --- Base paths (edit only base_dir if you ever move the folder) ---
+base_dir       <- "/Users/luki/Desktop/Master_Thesis/Master_Thesis_R/R_stuff/full_analysis"
+raw_fastq_dir  <- file.path(base_dir, "Raw_fastq")
+results_dir    <- file.path(base_dir, "results")
+trim_dir       <- file.path(base_dir, "2.trimmed")
+filt_dir       <- file.path(base_dir, "3.filtered")
+refdb_dir      <- file.path(base_dir, "5.refdb")
+
+# IMPORTANT: your intended metadata file
+metadata_file  <- file.path(base_dir, "0.metadata", "thesis_metadata.txt")
+
+meta_dir <- file.path(base_dir, "0.metadata")
+
+# helper for case-sensitivity-related problems
+ci_match <- function(keys, refs) match(tolower(keys), tolower(refs))
+
+
+# create dirs if missing
+dir.create(results_dir, recursive = TRUE, showWarnings = FALSE)
+dir.create(trim_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(filt_dir,    recursive = TRUE, showWarnings = FALSE)
+dir.create(refdb_dir,   recursive = TRUE, showWarnings = FALSE)
+
+cat("Using metadata file:\n", metadata_file, "\n")
+
+## --- Read metadata ONCE (don’t overwrite later) ---
+metadata <- readr::read_tsv(metadata_file, col_types = cols(Depth = col_character()))
+stopifnot("SampleID" %in% names(metadata))  # fail fast if missing
+
+## OPTIONAL: light cleaning
+metadata <- metadata |>
+  mutate(SampleID = tolower(trimws(SampleID)))
+
+## --- FASTQ lists ---
+raw_forward_reads <- sort(list.files(raw_fastq_dir, pattern = "R1_001\\.fastq\\.gz$", full.names = TRUE))
+raw_reverse_reads <- sort(list.files(raw_fastq_dir, pattern = "R2_001\\.fastq\\.gz$", full.names = TRUE))
+
+## --- Sample ID extraction from filenames (handles 16S/ITS2) ---
+file_ids <- basename(raw_forward_reads) |>
+  str_remove("-(16S|ITS2)_R1_001\\.fastq\\.gz") |>
+  tolower() |>
+  trimws()
+
+## --- Mismatch check (ignores case/whitespace) ---
+meta_ids <- unique(metadata$SampleID)
+missing_in_metadata <- setdiff(unique(file_ids), meta_ids)
+missing_in_files    <- setdiff(meta_ids, unique(file_ids))
+
+if (length(missing_in_metadata) > 0) {
+  cat("⚠️ In FASTQs but NOT in metadata:\n"); print(sort(missing_in_metadata))
+}
+if (length(missing_in_files) > 0) {
+  cat("⚠️ In metadata but NO FASTQs:\n"); print(head(sort(missing_in_files), 20))
+}
+
+# If you want to proceed only with overlap:
+keep <- file_ids %in% meta_ids
+raw_forward_reads <- raw_forward_reads[keep]
+raw_reverse_reads <- raw_reverse_reads[keep]
+
+# Define output paths using the safe full paths
+trimmed_forward_reads <- file.path(trim_dir, basename(raw_forward_reads))
+trimmed_reverse_reads <- file.path(trim_dir, basename(raw_reverse_reads))
+filtered_forward_reads <- file.path(filt_dir, basename(raw_forward_reads))
+filtered_reverse_reads <- file.path(filt_dir, basename(raw_reverse_reads))
+
+
+###########################################################################
+################ STEP 1: CHECK RAW SEQUENCE FILES ########################
+###########################################################################
+
+# Set variables
+raw_forward_reads <- sort(list.files(raw_fastq_dir, pattern = "R1_001.fastq.gz", full.names = TRUE))
+raw_reverse_reads <- sort(list.files(raw_fastq_dir, pattern = "R2_001.fastq.gz", full.names = TRUE))
+# Determine raw quality scores
+forward_raw_qual_plot <- plotQualityProfile(raw_forward_reads, aggregate = TRUE) + ggplot2::labs(title = "Forward Raw Reads") + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+reverse_raw_qual_plot <- plotQualityProfile(raw_reverse_reads, aggregate = TRUE) + ggplot2::labs(title = "Reverse Raw Reads") + ggplot2::theme(plot.title = ggplot2::element_text(hjust = 0.5))
+raw_qual_plots <- ggarrange(forward_raw_qual_plot, reverse_raw_qual_plot, ncol = 2)
+ggsave(filename = file.path("0.metadata", "raw_read_quality_plot_aggregated.pdf"), plot = raw_qual_plots, width = 10, height = 6)
+
+
+
+
+library(ShortRead)
+
+
+
+# Define custom read-counting function
+count_reads <- function(file_path) {
+  if (!file.exists(file_path)) return(NA)
+  length(readLines(file_path)) / 4
+}
+
+metadata <- metadata %>%
+  rowwise() %>%
+  mutate(
+    raw_reads_f = count_reads(file.path(raw_fastq_dir, paste0(SampleID, "-16S_R1_001.fastq.gz"))),
+    raw_reads_r = count_reads(file.path(raw_fastq_dir, paste0(SampleID, "-16S_R2_001.fastq.gz")))
+  ) %>%
+  ungroup()
+
+
+for (i in 1:nrow(metadata)) {
+  if (!is.na(metadata$raw_reads_f[i]) && 
+      !is.na(metadata$raw_reads_r[i]) && 
+      metadata$raw_reads_f[i] != metadata$raw_reads_r[i]) {
+    
+    cat("\nERROR: Mismatch in", metadata$SampleID[i], 
+        "- F:", metadata$raw_reads_f[i], 
+        "R:", metadata$raw_reads_r[i])
+  }
+}
+
+
+
+# Plot raw read count per sample (no grouping)
+mean_reads <- mean(metadata$raw_reads_f)
+
+ggplot(metadata, aes(x = reorder(SampleID, raw_reads_f), y = raw_reads_f)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  geom_hline(yintercept = mean_reads, linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = -Inf, y = mean_reads + max(metadata$raw_reads_f) * 0.02,
+           label = paste("Mean:", comma(round(mean_reads))),
+           hjust = -0.1, vjust = -0.5, size = 3, color = "red") +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0.05, 0.15))) +
+  labs(x = "Sample ID (ordered by read count)", y = "Raw Read Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        plot.margin = margin(r = 40), 
+        legend.position = "none")
+
+# Save plot
+ggsave(filename = file.path(meta_dir, "per_sample_raw_read_count.png"),
+       plot = last_plot(), bg = "white", dpi = 300)
+
+#######
+####### updated plot with all samples ##########
+
+library(ShortRead)
+
+
+# Set the path to your FASTQ folder
+fastq_dir <- file.path("full_analysis", "Raw_fastq")
+fastq_files <- list.files(fastq_dir, pattern = "\\.fastq\\.gz$", full.names = TRUE)
+
+# Count reads in each file
+read_counts <- sapply(fastq_files, function(f) {
+  fq <- readFastq(f)
+  length(fq)
+})
+
+# Create data frame
+read_df <- data.frame(
+  File = basename(fastq_files),
+  ReadCount = read_counts,
+  stringsAsFactors = FALSE
+)
+
+# Optional: extract Sample + Marker (e.g., from filename like "bis02_16S_R1_001.fastq.gz")
+read_df <- read_df %>%
+  mutate(SampleMarker = str_remove(File, "_R[12]_001\\.fastq\\.gz"))
+
+# Only keep forward reads (R1) to avoid double-counting
+read_df <- read_df %>% filter(grepl("_R1", File))
+
+# Reorder for plotting
+read_df <- read_df %>%
+  arrange(desc(ReadCount)) %>%
+  mutate(SampleMarker = factor(SampleMarker, levels = SampleMarker))
+
+####################---------- 1.Plot -----------#########################
+
+ggplot(read_df, aes(x = SampleMarker, y = ReadCount)) +
+  geom_bar(stat = "identity", fill = "#471323") +
+  geom_hline(yintercept = mean(read_df$ReadCount), linetype = "solid", color = "#FB607F") +
+  annotate("text", x = 1, y = mean(read_df$ReadCount) + max(read_df$ReadCount) * 0.02,
+           label = paste("Mean:", round(mean(read_df$ReadCount))),
+           hjust = 0, vjust = -0.5, size = 3, color = "#FB607F") +
+  labs(x = "Sample (with marker)", y = "Raw Read Count (Forward Reads Only)") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1, size = 7))
+
+
+
+p <- ggplot(read_df, aes(SampleMarker, ReadCount)) +
+  geom_bar(stat="identity", fill="#471323") +
+  geom_hline(yintercept=mean(read_df$ReadCount), color="#FB607F") +
+  annotate("text", x=1, y=mean(read_df$ReadCount)+max(read_df$ReadCount)*0.02,
+           label=paste("Mean:", round(mean(read_df$ReadCount))),
+           hjust=0, vjust=-0.5, size=3, color="#FB607F") +
+  labs(x="Sample (with marker)", y="Raw Read Count (Fwd)") +
+  theme_minimal() +
+  theme(axis.text.x=element_text(angle=45, hjust=1, size=7))
+
+ggsave(file.path(meta_dir, "per_sample_raw_read_count_marker.png"), p,
+       bg="white", dpi=300, width=10, height=6)
+
+ggsave(file.path(meta_dir, "per_sample_raw_read_count_marker.pdf"), p,
+       device = cairo_pdf, bg = "white", width = 10, height = 6)
+
+
+
+###############------------ END PLOT ---------------#################
+
+
+
+# Define function to count reads in fastq files
+count_reads <- function(file_path) {
+  if (!file.exists(file_path)) return(NA_real_)
+  ShortRead::countFastq(file_path)
+}
+
+
+# Create raw_reads_f and raw_reads_r columns
+metadata <- metadata %>%
+  rowwise() %>%
+  mutate(
+    raw_reads_f = count_reads(file.path(raw_fastq_dir, paste0(SampleID, "-16S_R1_001.fastq.gz"))),
+    raw_reads_r = count_reads(file.path(raw_fastq_dir, paste0(SampleID, "-16S_R2_001.fastq.gz")))
+  ) %>%
+  ungroup()
+
+
+#################---------- CHECKING NC ----------########################
+
+library(tidyverse)
+
+# Filter NCs (case-insensitive)
+neg_controls <- metadata %>%
+  filter(str_detect(SampleID, regex("nc", ignore_case = TRUE))) %>%
+  select(SampleID, raw_reads_f, raw_reads_r)
+
+# Long format, replace NA with 0 so bars show
+neg_long <- neg_controls %>%
+  pivot_longer(c(raw_reads_f, raw_reads_r),
+               names_to = "Direction", values_to = "ReadCount") %>%
+  mutate(Direction = recode(Direction,
+                            raw_reads_f = "Forward Reads",
+                            raw_reads_r = "Reverse Reads"),
+         ReadCount = replace_na(ReadCount, 0))
+
+# Plot object
+p_nc <- ggplot(neg_long, aes(SampleID, ReadCount, fill = Direction)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  scale_fill_manual(values = c("Forward Reads" = "#471323",
+                               "Reverse Reads" = "#FB607F")) +
+  labs(title = "Raw Read Counts for Negative Controls",
+       x = "Sample ID", y = "Raw Read Count", fill = "Read Direction") +
+  scale_y_continuous(labels = scales::comma) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Save PNG
+ggsave(file.path(meta_dir, "negative_controls_read_counts.png"),
+       p_nc, bg = "white", dpi = 300, width = 10, height = 6)
+
+# Save PDF
+ggsave(file.path(meta_dir, "negative_controls_read_counts.pdf"),
+       p_nc, bg = "white", width = 10, height = 6)
+
+
+#################---------- END CHECKING NC ----------########################
+
+
+##—– 1.  Total reads across all samples  —–##
+cat("Total forward reads:", sum(metadata$raw_reads_f, na.rm = TRUE), "\n")
+cat("Total reverse reads :", sum(metadata$raw_reads_r, na.rm = TRUE), "\n")
+
+##—– 2.  Per-sample read counts for NCs  —–##
+neg_controls <- metadata %>%
+  filter(str_detect(SampleID, "NC")) %>%
+  select(SampleID, raw_reads_f, raw_reads_r)
+
+print(neg_controls, n = Inf)
+
+##—– 3.  Cross-check NCs in metadata vs. FASTQ files  —–##
+extract_stub <- function(x) str_extract(x, "^[^_]+(?=-(16S|ITS2))") |> tolower()
+
+r1_NC_stubs <- list.files(raw_fastq_dir, pattern = "NC.*R1_001\\.fastq\\.gz$", full.names = FALSE) |> extract_stub()
+r2_NC_stubs <- list.files(raw_fastq_dir, pattern = "NC.*R2_001\\.fastq\\.gz$", full.names = FALSE) |> extract_stub()
+
+meta_NC_stubs <- metadata$SampleID |> trimws() |> tolower() |> keep(~ str_detect(., "nc"))
+
+NC_check <- tibble(sample = union(union(r1_NC_stubs, r2_NC_stubs), meta_NC_stubs)) %>%
+  mutate(
+    in_R1   = sample %in% r1_NC_stubs,
+    in_R2   = sample %in% r2_NC_stubs,
+    in_meta = sample %in% meta_NC_stubs
+  )
+
+print(NC_check, n = Inf)
+
+
+###################--------------- CROSS CHECK -------------############################
+
+# 1 ── List FASTQ files
+r1_files <- list.files(raw_fastq_dir, pattern = "R1_001\\.fastq\\.gz$", full.names = FALSE)
+r2_files <- list.files(raw_fastq_dir, pattern = "R2_001\\.fastq\\.gz$", full.names = FALSE)
+
+# 2 ── Build unified plot_df (drives both presence-tile and status-tile)
+r1_samples <- gsub("_R1_001\\.fastq\\.gz$", "", r1_files)
+r2_samples <- gsub("_R2_001\\.fastq\\.gz$", "", r2_files)
+
+plot_df <- tibble(sample = unique(c(r1_samples, r2_samples, metadata$SampleID))) %>%
+  mutate(
+    in_R1  = sample %in% r1_samples,
+    in_R2  = sample %in% r2_samples,
+    in_meta = sample %in% metadata$SampleID,
+    Marker = case_when(
+      str_detect(sample, "16S")  ~ "16S",
+      str_detect(sample, "ITS2") ~ "ITS2",
+      TRUE ~ NA_character_
+    ),
+    BaseSample = str_remove(sample, "-(16S|ITS2)$"),
+    # for the first tile (presence by in_R1)
+    Marker_Presence = paste0(Marker, "_", in_R1),
+    # for the status tile
+    Status = case_when(
+      !is.na(Marker) & in_R1 & in_R2   ~ "Sequenced",
+      !is.na(Marker) & (in_R1 | in_R2) ~ "Amplified but no data",
+      TRUE                             ~ "Not Attempted"
+    ),
+    Marker = factor(Marker, levels = c("16S","ITS2")),
+    Status = factor(Status, levels = c("Sequenced","Amplified but no data","Not Attempted"))
+  ) %>%
+  arrange(BaseSample, Marker) %>%
+  mutate(BaseSample = factor(BaseSample, levels = unique(BaseSample)))
+
+# 4 ── Colors
+marker_colors <- c(
+  "16S_TRUE"  = "#1b9e77",
+  "16S_FALSE" = "#d2f0e3",
+  "ITS2_TRUE" = "#7570b3",
+  "ITS2_FALSE"= "#e2dbf4"
+)
+
+# 5 ── Plot
+ggplot(plot_df %>% filter(in_R1), aes(x = BaseSample, y = Marker, fill = Marker_Presence)) +
+  geom_tile(color = "white", width = 0.9, height = 0.9) +
+  scale_fill_manual(values = marker_colors, guide = "none") +
+  coord_fixed(ratio = 1.5) +
+  labs(x = "Sample", y = "Marker") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+        panel.grid = element_blank())
+
+
+ggsave(file.path(meta_dir, "marker_presence_tile.png"), last_plot(),
+       bg = "white", dpi = 300, width = 10, height = 5)
+ggsave(file.path(meta_dir, "marker_presence_tile.pdf"), last_plot(),
+       device = cairo_pdf, bg = "white", width = 10, height = 5)
+
+
+
+############################################################
+### 4. Diagnostics
+############################################################
+
+cat("\n✅ Summary Stats:\n")
+cat("Total rows in plot_df:", nrow(plot_df), "\n")
+cat("Unique base samples:", length(unique(plot_df$BaseSample)), "\n\n")
+
+cat("📊 Marker distribution:\n")
+print(table(plot_df$Marker))
+
+cat("\n📊 Status breakdown:\n")
+print(table(plot_df$Status, useNA = "ifany"))
+
+expected_samples <- tolower(unique(metadata$SampleID))
+actual_samples   <- tolower(unique(plot_df$BaseSample))
+
+extra_samples <- setdiff(actual_samples, expected_samples)
+missing_files <- setdiff(expected_samples, actual_samples)
+
+cat("\n🧪 Extra (in FASTQ, not metadata):\n"); print(sort(extra_samples))
+cat("\n🧪 Missing (in metadata, no FASTQ):\n"); print(sort(missing_files))
+
+
+###################################################################################
+
+
+##################################################################
+############### Step 2 :  trim primer sequences  #################
+##################################################################
+
+library(dada2)
+library(stringr)
+library(dplyr)
+
+cutadapt <- "/Users/luki/Library/Python/3.9/bin/cutadapt"
+system2(cutadapt, "--version")
+
+## ── primer blocks ──────────────────────────────────────────────
+primer_sets <- list(
+  "16S" = list(
+    R1 = "-g ACGCGHNRAACCTTACC -a TTGYACWCACYGCCCGT",
+    R2 = "-G ACGGGCRGTGWGTRCAA -A GGTAAGGTTYNDCGCGT"),
+  "ITS2" = list(
+    R1 = "-g GTGAATTGCAGAACTCCGTG -a AAGCATAATAAGTAAGCGGAG",
+    R2 = "-G CCTCCGCTTACTTATATGCTT -A CACGGAGTTCTGCAATTCAC")
+)
+
+## ── setup metadata columns ─────────────────────────────────────
+metadata$trimmed_reads_16S <- NA_real_
+metadata$trimmed_reads_ITS2 <- NA_real_
+metadata$retained_pct_16S <- NA_real_
+metadata$retained_pct_ITS2 <- NA_real_
+
+## ── output directory setup ─────────────────────────────────────
+# Trimmed reads output inside full_analysis/2.trimmed
+trimmed_fastq_dir <- file.path(base_dir, "2.trimmed")
+dir.create(trimmed_fastq_dir, showWarnings = FALSE, recursive = TRUE)
+
+trimmed_forward_reads <- file.path(trimmed_fastq_dir, basename(raw_forward_reads))
+trimmed_reverse_reads <- file.path(trimmed_fastq_dir, basename(raw_reverse_reads))
+
+
+## ── file structure diagnostics ─────────────────────────────────
+cat("=== FILE STRUCTURE ANALYSIS ===\n")
+cat("Total raw forward files:", length(raw_forward_reads), "\n")
+
+filenames <- basename(raw_forward_reads)
+print(head(filenames, 10))
+
+marker_16S  <- sum(grepl("16S",  filenames, ignore.case = TRUE))
+marker_ITS2 <- sum(grepl("ITS2", filenames, ignore.case = TRUE))
+cat("Files with 16S:", marker_16S, "\n")
+cat("Files with ITS2:", marker_ITS2, "\n")
+
+# Sample IDs from files (normalize case + whitespace)
+sample_ids_from_files <- filenames |>
+  stringr::str_remove("-(16S|ITS2)_R1_001\\.fastq\\.gz$") |>
+  tolower() |>
+  trimws()
+
+unique_samples_from_files <- unique(sample_ids_from_files)
+
+# Metadata IDs normalized too
+meta_ids <- metadata$SampleID |>
+  tolower() |>
+  trimws()
+unique_meta_ids <- unique(meta_ids)
+
+cat("Unique samples from files:", length(unique_samples_from_files), "\n")
+cat("Unique samples in metadata:", length(unique_meta_ids), "\n")
+
+samples_in_both <- intersect(unique_samples_from_files, unique_meta_ids)
+cat("Samples in both files and metadata:", length(samples_in_both), "\n")
+
+# --- OPTIONAL: ignore NCs in mismatch check (set to TRUE to ignore) ---
+ignore_NCs <- FALSE
+drop_nc <- function(x) if (ignore_NCs) x[!grepl("nc$", x, ignore.case = TRUE)] else x
+
+missing_in_metadata <- setdiff(drop_nc(unique_samples_from_files), drop_nc(unique_meta_ids))
+missing_in_files    <- setdiff(drop_nc(unique_meta_ids), drop_nc(unique_samples_from_files))
+
+if (length(missing_in_metadata) > 0 || length(missing_in_files) > 0) {
+  cat("❌ MISMATCH detected!\n")
+  if (length(missing_in_metadata) > 0) {
+    cat("Samples in files but not in metadata:\n")
+    print(head(sort(missing_in_metadata), 20))
+  }
+  if (length(missing_in_files) > 0) {
+    cat("Samples in metadata but not in files:\n")
+    print(head(sort(missing_in_files), 20))
+  }
+} else {
+  cat("✅ No mismatches after normalization.\n")
+}
+
+
+# Show yesterday's suspects in metadata
+metadata$SampleID[grepl("^ada|^bis", metadata$SampleID)]
+
+# Show what FASTQ says we have
+basename(raw_forward_reads)
+
+
+
+#################################################################################
+## --- QUICK CUTADAPT DIAGNOSTIC / AUTO-FIND  -------------------------------- ##
+#################################################################################
+
+# helper (define BEFORE use)
+`%||%` <- function(a,b) if (is.null(a) || length(a)==0) b else a
+
+# Start candidate list
+cand <- character(0)
+if (exists("cutadapt") && is.character(cutadapt) && nzchar(cutadapt)) cand <- c(cand, cutadapt)
+
+# Add PATH hit and common locations
+pth <- Sys.which("cutadapt"); if (nzchar(pth)) cand <- c(cand, pth)
+cand <- c(
+  cand,
+  Sys.glob("~/Library/Python/*/bin/cutadapt"),
+  Sys.glob("~/.local/bin/cutadapt"),
+  "/opt/homebrew/bin/cutadapt",
+  "/usr/local/bin/cutadapt"
+)
+cand <- unique(cand[file.exists(cand)])
+
+if (length(cand)) {
+  cutadapt <- cand[1]
+  cat("✅ Using cutadapt at:", cutadapt, "\n")
+} else {
+  cat("⚠️ Could not find 'cutadapt' binary by path.\n")
+}
+
+# Smoke test (you said this prints 5.1—great)
+system2(cutadapt, "--version")
+
+# Safe runner
+run_cutadapt <- function(args) {
+  if (exists("cutadapt") && is.character(cutadapt) && nzchar(cutadapt) && file.exists(cutadapt)) {
+    return(tryCatch(system2(cutadapt, args, stdout = TRUE, stderr = TRUE), error = function(e) NULL))
+  }
+  if (nzchar(Sys.which("cutadapt"))) {
+    return(tryCatch(system2("cutadapt", args, stdout = TRUE, stderr = TRUE), error = function(e) NULL))
+  }
+  tryCatch(system2("python3", c("-m","cutadapt", args), stdout = TRUE, stderr = TRUE), error = function(e) NULL)
+}
+
+#################################################################################
+## ───────────────────────────  MAIN CUTADAPT LOOP  ─────────────────────────── ##
+#################################################################################
+
+cat("\n=== RUNNING CUTADAPT ===\n")
+
+# Be safe with types
+metadata$SampleID <- as.character(metadata$SampleID)
+metadata <- metadata %>% mutate(SampleID = trimws(SampleID))
+
+trimming_results <- data.frame(
+  filename = character(),
+  sample_id = character(),
+  marker = character(),
+  trimmed_reads = numeric(),
+  success = logical(),
+  stringsAsFactors = FALSE
+)
+
+# --- Ensure NCs from FASTQs exist in metadata (case-insensitive) ---
+filenames <- basename(raw_forward_reads)
+
+nc_from_files <- filenames %>%
+  stringr::str_remove("-(16S|ITS2)_R1_001\\.fastq\\.gz$") %>%
+  unique()
+
+nc_mask <- grepl("nc$", nc_from_files, ignore.case = TRUE)
+nc_from_files <- nc_from_files[nc_mask]
+
+# compute missing (compare lowercase), but ADD using original casing from filenames
+missing_nc_lc <- setdiff(tolower(nc_from_files), tolower(metadata$SampleID))
+if (length(missing_nc_lc) > 0) {
+  add_names <- nc_from_files[tolower(nc_from_files) %in% missing_nc_lc]
+  cat("➕ Adding missing NCs to metadata:", paste(add_names, collapse = ", "), "\n")
+  add_rows <- tibble::tibble(SampleID = add_names)
+  needed_cols <- c("trimmed_reads_16S","trimmed_reads_ITS2",
+                   "retained_pct_16S","retained_pct_ITS2",
+                   "raw_reads_f","raw_reads_r")
+  for (nm in needed_cols) if (!nm %in% names(metadata)) metadata[[nm]] <- NA_real_
+  metadata <- dplyr::bind_rows(metadata, add_rows)
+}
+
+# case-insensitive match helper
+match_meta_idx <- function(id) which(tolower(metadata$SampleID) == tolower(id))
+
+for (i in seq_along(raw_forward_reads)) {
+  filename  <- basename(raw_forward_reads[i])
+  marker    <- if (grepl("ITS", filename, ignore.case = TRUE)) "ITS2" else "16S"
+  sample_id <- sub("-(16S|ITS2)_R1_001\\.fastq\\.gz$", "", filename)
+  
+  args <- c(
+    primer_sets[[marker]]$R1,
+    primer_sets[[marker]]$R2,
+    "--overlap", "15", "--no-indels",
+    "-e", "0.1",
+    "--discard-untrimmed",
+    "-o", trimmed_forward_reads[i],
+    "-p", trimmed_reverse_reads[i],
+    raw_forward_reads[i], raw_reverse_reads[i]
+  )
+  
+  cat("Processing", sample_id, "as", marker, "(", i, "/", length(raw_forward_reads), ")\n")
+  out <- run_cutadapt(args)
+  if (is.null(out)) stop("❌ Could not execute cutadapt. See diagnostic above.")
+  
+  # Parse Cutadapt 5.x output robustly
+  # Examples seen: "Pairs written (passing filters): 12,345"
+  #                "Reads written (passing filters): 12,345"
+  pw_line <- grep("(Pairs|Reads) written \\(passing filters\\):", out, value = TRUE)[1]
+  if (!is.na(pw_line)) {
+    trimmed <- as.numeric(gsub(",", "", sub(".*: *([0-9,]+).*", "\\1", pw_line)))
+  } else {
+    trimmed <- NA_real_
+    cat("❌ Could not extract trimmed read count for", filename, "\n")
+    cat(paste(tail(out, 20), collapse = "\n"), "\n")
+  }
+  
+  trimming_results <- rbind(trimming_results, data.frame(
+    filename = filename,
+    sample_id = sample_id,
+    marker = marker,
+    trimmed_reads = ifelse(is.na(trimmed), 0, trimmed),
+    success = !is.na(trimmed),
+    stringsAsFactors = FALSE
+  ))
+  
+  # assignment (case-insensitive)
+  idx <- match_meta_idx(sample_id)
+  if (!is.na(trimmed) && length(idx) == 1) {
+    col_name <- paste0("trimmed_reads_", marker)
+    metadata[[col_name]][idx] <- trimmed
+  } else if (!is.na(trimmed) && length(idx) > 1) {
+    cat("⚠️ Duplicate SampleID in metadata for", sample_id, "— assigning to all matches.\n")
+    col_name <- paste0("trimmed_reads_", marker)
+    metadata[[col_name]][idx] <- trimmed
+  } else if (length(idx) == 0) {
+    cat("⚠️ Sample", sample_id, "not found in metadata (even after NC add)\n")
+  }
+}
+
+
+## ── post-processing summarization ──────────────────────────────
+cat("\n=== TRIMMING SUMMARY ===\n")
+
+print(trimming_results)
+
+success_summary <- trimming_results %>%
+  group_by(marker, success) %>%
+  summarise(count = n(), .groups = 'drop')
+
+print(success_summary)
+
+metadata$retained_pct_16S <- ifelse(
+  !is.na(metadata$raw_reads_f) & !is.na(metadata$trimmed_reads_16S) & metadata$trimmed_reads_16S > 0,
+  round(metadata$trimmed_reads_16S / metadata$raw_reads_f * 100, 1),
+  NA_real_
+)
+
+
+metadata$retained_pct_ITS2 <- ifelse(
+  !is.na(metadata$raw_reads_f) & !is.na(metadata$trimmed_reads_ITS2) & metadata$trimmed_reads_ITS2 > 0,
+  round(metadata$trimmed_reads_ITS2 / metadata$raw_reads_f * 100, 1),
+  NA_real_
+)
+
+metadata$trimming_retained_pct <- pmax(
+  metadata$retained_pct_16S, 
+  metadata$retained_pct_ITS2, 
+  na.rm = TRUE
+)
+
+metadata$trimming_retained_pct[is.infinite(metadata$trimming_retained_pct)] <- NA_real_
+
+metadata$marker_status <- case_when(
+  !is.na(metadata$trimmed_reads_16S) & !is.na(metadata$trimmed_reads_ITS2) ~ "Both",
+  !is.na(metadata$trimmed_reads_16S) ~ "16S only",
+  !is.na(metadata$trimmed_reads_ITS2) ~ "ITS2 only",
+  TRUE ~ "None"
+)
+
+## ── final diagnostics ──────────────────────────────────────────
+cat("\n=== FINAL DIAGNOSTICS ===\n")
+cat("Samples with 16S data:", sum(!is.na(metadata$trimmed_reads_16S)), "\n")
+cat("Samples with ITS2 data:", sum(!is.na(metadata$trimmed_reads_ITS2)), "\n")
+cat("Samples with any trimmed data:", sum(!is.na(metadata$trimming_retained_pct)), "\n")
+cat("Samples with no trimmed data:", sum(is.na(metadata$trimming_retained_pct)), "\n")
+
+marker_summary <- metadata %>%
+  select(SampleID, trimmed_reads_16S, trimmed_reads_ITS2) %>%
+  mutate(
+    has_16S = !is.na(trimmed_reads_16S) & trimmed_reads_16S > 0,
+    has_ITS2 = !is.na(trimmed_reads_ITS2) & trimmed_reads_ITS2 > 0,
+    marker_combo = case_when(
+      has_16S & has_ITS2 ~ "Both",
+      has_16S ~ "16S only",
+      has_ITS2 ~ "ITS2 only",
+      TRUE ~ "None"
+    )
+  )
+
+print(table(marker_summary$marker_combo))
+
+  
+unique_trimmed_samples <- metadata %>%
+  filter(!is.na(trimmed_reads_16S) | !is.na(trimmed_reads_ITS2)) %>%
+  pull(SampleID) %>%
+  unique()
+
+length(unique_trimmed_samples)  # should be 32
+
+# Get unique SampleIDs with either 16S or ITS2 trimmed reads
+trimmed_sample_ids <- metadata %>%
+  filter(!is.na(trimmed_reads_16S) | !is.na(trimmed_reads_ITS2)) %>%
+  pull(SampleID) %>%
+  unique() %>%
+  sort()
+
+# Print count and list
+cat("Total samples with trimmed data:", length(trimmed_sample_ids), "\n")
+print(trimmed_sample_ids)
+
+
+#######################################################################
+##                     NORTH/SOUTH COMPARISON                        ##
+#######################################################################
+
+# Get 32 samples with any trimmed reads
+trimmed_sample_ids <- metadata %>%
+  filter(!is.na(trimmed_reads_16S) | !is.na(trimmed_reads_ITS2)) %>%
+  pull(SampleID) %>%
+  unique()
+
+# Create a small dataframe for summary
+sample_region_summary <- tibble(SampleID = trimmed_sample_ids) %>%
+  mutate(region = case_when(
+    str_detect(SampleID, "^(ada|bis|oku)") ~ "north",
+    str_detect(SampleID, "^(gin|mak|miz|res-sun|res-mak|res-miz)") ~ "south",
+    TRUE ~ "unknown"
+  ))
+
+# Show summary
+cat("=== Region assignment ===\n")
+print(sample_region_summary)
+
+cat("\n=== Sample count by region ===\n")
+print(table(sample_region_summary$region))
+
+########
+
+library(ggplot2)
+
+# Join marker status and region info
+marker_region_summary <- metadata %>%
+  filter(SampleID %in% trimmed_sample_ids) %>%
+  left_join(
+    sample_region_summary,
+    by = "SampleID"
+  )
+
+ggplot(marker_region_summary, aes(x = region, fill = marker_status)) +
+  geom_bar(position = "stack") +
+  labs(title = "Marker Presence by Region",
+       x = "Region",
+       y = "Number of Samples",
+       fill = "Markers Detected") +
+  theme_minimal()
+
+
+
+# correct stacking order, "both" at the bottom
+marker_region_summary$marker_status <- factor(
+  marker_region_summary$marker_status,
+  levels = c("None", "ITS2 only", "16S only", "Both")  # reversed order
+)
+
+
+# Define custom colors (you can change these)
+marker_colors <- c(
+  "Both" = "#515A47",
+  "16S only" = "#1b9e77",
+  "ITS2 only" = "#7570b3",
+  "None" = "grey80"
+)
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(tidyr)
+
+# --- region as an ordered factor (optional, keeps bars in a nice order)
+marker_region_summary <- marker_region_summary %>%
+  mutate(region = factor(region, levels = c("north","south","unknown")))
+
+# --- correct stacking order: Both at the bottom -> put "Both" first
+marker_region_summary <- marker_region_summary %>%
+  mutate(marker_status = factor(marker_status,
+                                levels = c("ITS2 only","16S only","Both")))
+
+# colors (match the levels above)
+marker_colors <- c(
+  "Both" = "#515A47",
+  "16S only" = "#1b9e77",
+  "ITS2 only" = "#7570b3",
+  "None" = "grey80"
+)
+
+# --- Summarize counts per region (force dplyr's count)
+region_counts <- marker_region_summary %>%
+  dplyr::count(region, name = "n")
+
+# --- Plot
+ggplot(marker_region_summary, aes(x = region, fill = marker_status)) +
+  geom_bar(position = "stack", width = 0.7, color = "white") +
+  geom_text(
+    data = region_counts,
+    aes(x = region, y = n + 1, label = n),
+    inherit.aes = FALSE,
+    size = 4
+  ) +
+  scale_fill_manual(values = marker_colors, drop = FALSE) +
+  labs(x = NULL, y = "Number of Samples", fill = "Markers Detected") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "right", panel.grid.major.x = element_blank())
+
+ggsave("marker_by_region_slim.pdf", width = 6, height = 4)
+
+
+########################## PROPORTIONS ####################################
+
+
+# Define how many samples are in each region
+n_north <- sum(str_detect(metadata$SampleID, "^(ada|bis|oku)"))
+n_south <- sum(str_detect(metadata$SampleID, "^(gin|mak|miz|res-sun|res-mak|res-miz)"))
+
+# Total number of samples (as you said)
+n_total <- 108
+
+# Calculate percentages
+pct_north <- round(100 * n_north / n_total, 1)
+pct_south <- round(100 * n_south / n_total, 1)
+
+# Print results
+cat("North:", pct_north, "% of total samples\n")
+cat("South:", pct_south, "% of total samples\n")
+
+################################################################################
+
+table(marker_region_summary$marker_status, marker_region_summary$region)
+
+both_north <- sum(marker_region_summary$marker_status == "Both" & marker_region_summary$region == "north")
+both_south <- sum(marker_region_summary$marker_status == "Both" & marker_region_summary$region == "south")
+
+cat("Both in North:", both_north, "\n")
+cat("Both in South:", both_south, "\n")
+
+pct_both_north <- round(100 * both_north / 37, 1)
+pct_both_south <- round(100 * both_south / 71, 1)
+
+cat("Proportion of 'Both' in North:", pct_both_north, "%\n")
+cat("Proportion of 'Both' in South:", pct_both_south, "%\n")
+
+
+library(ggplot2)
+
+# Create a compact dataframe for plotting
+both_prop_df <- tibble::tibble(
+  region = c("North", "South"),
+  total_samples = c(37, 71),
+  both_detections = c(16, 8)
+) %>%
+  mutate(
+    percent_both = round(100 * both_detections / total_samples, 1)
+  )
+
+# Plot
+ggplot(both_prop_df, aes(x = region, y = percent_both, fill = region)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white") +
+  geom_text(aes(label = paste0(percent_both, "%")), 
+            vjust = -0.5, size = 5, fontface = "bold") +
+  scale_fill_manual(values = c("North" = "#1b9e77", "South" = "#d95f02")) +
+  ylim(0, max(both_prop_df$percent_both) + 10) +
+  labs(
+    title = "Proportion of 'Both' Marker Detections per Region",
+    subtitle = "North has higher success rate despite fewer samples overall",
+    x = "Region",
+    y = "% of Samples with Both Markers"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank()
+  )
+
+
+
+#################----- % OF DUAL DETECTIONS ----#######################
+
+
+
+library(dplyr)
+library(ggplot2)
+
+# Manually calculate percentages
+total_both <- 16 + 8
+north_pct_of_both <- round(100 * 16 / total_both, 1)
+south_pct_of_both <- round(100 * 8 / total_both, 1)
+
+total_samples <- 108
+north_pct_total <- round(100 * 37 / total_samples, 1)
+south_pct_total <- round(100 * 71 / total_samples, 1)
+
+# Data for plotting
+df <- tibble(
+  region = c("North", "South"),
+  both_detections = c(16, 8),
+  total_samples = c(37, 71)
+) %>%
+  mutate(
+    pct_of_both = c(north_pct_of_both, south_pct_of_both),
+    label = paste0(both_detections, " samples\n(", pct_of_both, "% of all dual detections)")
+  )
+# Plot
+both_plot <- ggplot(df, aes(x = region, y = both_detections, fill = region)) +
+  geom_bar(stat = "identity", width = 0.6, color = "white") +
+  geom_text(
+    aes(label = label, y = both_detections + 1.5),
+    size = 3.5
+  ) +
+  scale_fill_manual(values = c("North" = "#73A6AD", "South" = "#FB607F")) +
+  coord_cartesian(ylim = c(0, max(df$both_detections) + 5)) +  # prevents clipping issues
+  labs(
+    # title = "16S + ITS2 Marker Detection by Region",
+    # subtitle = paste0(
+    #   "North: ", north_pct_total, "% of all samples but ",
+    #   north_pct_of_both, "% of all dual detections\n",
+    #   "South: ", south_pct_total, "% of all samples but ",
+    #   south_pct_of_both, "% of all dual detections"
+    # ),
+    x = "Region",
+    y = "Number of Samples with 16S + ITS2 Markers"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position = "none",
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "plain", size = 13),
+    plot.subtitle = element_text(face = "plain", size = 11),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10)
+  )
+
+print(both_plot)
+
+
+# Save
+ggsave("both_marker_by_region.pdf", plot = both_plot, width = 6.5, height = 5)
+
+
+#######################################################################
+##                  END OF NORTH/SOUTH COMPARISON                    ##
+#######################################################################
+
+
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+library(tidyr)
+
+# Prepare long-format data, extract base sample name (e.g., "oku03" from "oku03-16S")
+marker_long_grouped <- metadata %>%
+  select(SampleID, raw_reads_f, trimmed_reads_16S, trimmed_reads_ITS2) %>%
+  pivot_longer(
+    cols = starts_with("trimmed_reads"),
+    names_to = "marker",
+    names_prefix = "trimmed_reads_",
+    values_to = "trimmed_reads"
+  ) %>%
+  filter(!is.na(trimmed_reads) & trimmed_reads > 0) %>%
+  mutate(
+    base_sample = str_remove(SampleID, "-(16S|ITS2)$"),
+    trimming_retained_pct = round(trimmed_reads / raw_reads_f * 100, 1)
+  )
+
+# Plot
+ggplot(marker_long_grouped, aes(x = base_sample, y = trimmed_reads, fill = marker)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    aes(label = paste0(trimmed_reads, " (", trimming_retained_pct, "%)")),
+    position = position_dodge(width = 0.8),
+    vjust = -0.4,
+    size = 3
+  ) +
+  scale_fill_manual(values = c("16S" = "#1b9e77", "ITS2" = "#7570b3")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.1))) +
+  coord_flip() +
+  labs(
+    title = "Trimmed Reads per Marker (Grouped by Sample)",
+    x = "Sample",
+    y = "Number of Trimmed Reads",
+    fill = "Marker"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+    panel.grid.major.x = element_blank()
+  )
+
+# Assuming marker_long_grouped is already created
+
+# Count number of markers per base sample
+marker_long_grouped <- marker_long_grouped %>%
+  group_by(base_sample) %>%
+  mutate(n_markers = n()) %>%
+  ungroup()
+
+# Plot
+ggplot(marker_long_grouped, aes(x = reorder(base_sample, base_sample), y = trimmed_reads, fill = marker)) +
+  geom_bar(
+    stat = "identity",
+    position = position_dodge(width = 0.8),
+    width = ifelse(marker_long_grouped$n_markers == 1, 0.35, 0.7)
+  ) +
+  geom_text(
+    aes(label = paste0("(", trimming_retained_pct, "%)")),
+    position = position_dodge(width = 0.8),
+    hjust = -0.1,
+    size = 3
+  ) +
+  scale_fill_manual(values = c("16S" = "#1b9e77", "ITS2" = "#7570b3")) +
+  scale_y_continuous(
+    labels = scales::comma,
+    breaks = seq(0, 50000, by = 10000),  # add x-axis gridlines
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  coord_flip() +
+  labs(
+    x = NULL,  # Remove "Sample" axis title since it's obvious
+    y = "Number of Trimmed Reads",
+    fill = "Marker"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.major.x = element_line(color = "grey80"),
+    panel.grid.major.y = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5),
+    legend.position = "right"
+  )
+
+
+
+################.....................................###################
+
+#############################################
+## Per-marker stacked plots (raw vs trimmed)
+#############################################
+
+library(dplyr)
+library(ggplot2)
+library(scales)
+library(stringr)
+
+plot_trimmed_reads_by_marker <- function(marker_name, fill_color) {
+  
+  # Build column name for this marker
+  trimmed_col <- paste0("trimmed_reads_", marker_name)
+  
+  # Prepare and sort data
+  meta_marker <- metadata %>%
+    filter(!is.na(raw_reads_f), !is.na(.data[[trimmed_col]])) %>%
+    mutate(
+      trimmed_reads = .data[[trimmed_col]],
+      trimming_retained_pct = round(100 * trimmed_reads / raw_reads_f, 1)
+    ) %>%
+    arrange(trimmed_reads) %>%
+    mutate(SampleID = factor(SampleID, levels = SampleID))
+  
+  max_y <- max(meta_marker$raw_reads_f, na.rm = TRUE)
+  
+  # Create the plot
+  p <- ggplot(meta_marker, aes(x = SampleID)) +
+    geom_bar(aes(y = raw_reads_f, fill = "raw_reads"), stat = "identity", width = 0.7) +
+    geom_bar(aes(y = trimmed_reads, fill = "trimmed_reads"), stat = "identity", width = 0.7) +
+    geom_text(
+      aes(y = raw_reads_f,
+          label = paste0(comma(trimmed_reads), " (", sprintf("%.1f%%", trimming_retained_pct), ")")),
+      hjust = -0.1, size = 3, color = "black",
+      position = position_nudge(y = max_y * 0.02)
+    ) +
+    scale_fill_manual(
+      values = c(trimmed_reads = fill_color, raw_reads = "#BBC6C8"),
+      breaks = c("raw_reads", "trimmed_reads"),
+      labels = c(raw_reads = "Raw read count", trimmed_reads = paste(marker_name, "trimmed"))
+    ) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.20))) +
+    coord_flip() +
+    labs(
+      title = paste0(marker_name, " Read Counts Before and After Trimming"),
+      x = "Sample ID", y = "Number of Reads", fill = ""
+    ) +
+    theme_minimal() +
+    theme(legend.position = "top", panel.grid.major.y = element_blank())
+  
+  # Print plot to R session
+  print(p)
+  
+  # Ensure output directory exists
+  dir.create(meta_dir, showWarnings = FALSE, recursive = TRUE)
+  
+  # Save PNG
+  ggsave(
+    filename = file.path(meta_dir, paste0("stacked_trimmed_", marker_name, ".png")),
+    plot = p, bg = "white", dpi = 300, width = 8, height = 6
+  )
+}
+
+# Run for both markers
+plot_trimmed_reads_by_marker("16S",  "#1b9e77")
+plot_trimmed_reads_by_marker("ITS2", "#7570b3")
+
+
+
+
+##################################################################
+############### Step 4 : quality filtering (per marker) ##########
+##################################################################
+
+library(dada2)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(scales)
+
+# Helpers ---------------------------------------------------------
+clean_base <- function(x) {
+  x |>
+    basename() |>
+    sub("_R[12]_001\\.fastq\\.gz$", "", x = _) |>
+    sub("-(16S|ITS2?)$", "", x = _)
+}
+
+get_marker <- function(x) ifelse(grepl("ITS2?", x, ignore.case = TRUE), "ITS2", "16S")
+
+# Build file table from existing trimmed files --------------------
+stopifnot(exists("trim_dir"), exists("filt_dir"), exists("meta_dir"))
+dir.create(filt_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(meta_dir, showWarnings = FALSE, recursive = TRUE)
+
+trim_R1 <- list.files(trim_dir, pattern = "-(16S|ITS2?)_R1_001\\.fastq\\.gz$", full.names = TRUE, ignore.case = TRUE)
+trim_R2 <- sub("_R1_", "_R2_", trim_R1)
+stopifnot(length(trim_R1) == length(trim_R2))
+
+files_tbl <- tibble(
+  trim_F = trim_R1,
+  trim_R = trim_R2
+) |>
+  mutate(
+    marker = get_marker(trim_F),
+    base   = clean_base(trim_F),
+    filt_F = file.path(filt_dir, basename(trim_F)),
+    filt_R = file.path(filt_dir, basename(trim_R))
+  )
+
+# Marker-specific parameters (tune if needed)
+flt_params <- list(
+  "16S"  = list(truncLen = c(225, 216), maxEE = c(2, 2), minLen = 100),
+  "ITS2" = list(truncLen = c(250, 200), maxEE = c(2, 2), minLen = 100)
+)
+
+# Run filterAndTrim per marker -----------------------------------
+filtered_out_list <- list()
+for (mk in c("16S","ITS2")) {
+  subdf <- files_tbl %>% filter(marker == mk)
+  if (nrow(subdf) == 0) next
+  p <- flt_params[[mk]]
+  message("Filtering ", mk, " (", nrow(subdf), " pairs)")
+  filtered_out_list[[mk]] <- filterAndTrim(
+    fwd = subdf$trim_F, filt = subdf$filt_F,
+    rev = subdf$trim_R, filt.rev = subdf$filt_R,
+    trimLeft = c(0,0),
+    truncLen = p$truncLen, maxEE = p$maxEE,
+    truncQ = 2, minLen = p$minLen,
+    maxN = 0, rm.phix = TRUE, compress = TRUE, multithread = TRUE
+  )
+  # Clean row names to SampleID
+  rn <- rownames(filtered_out_list[[mk]]) |> clean_base()
+  rownames(filtered_out_list[[mk]]) <- rn
+}
+
+# Map filtered reads back to metadata (per marker) — CASE-INSENSITIVE
+metadata$filtered_reads_16S  <- NA_real_
+metadata$filtered_reads_ITS2 <- NA_real_
+
+for (mk in names(filtered_out_list)) {
+  fo <- filtered_out_list[[mk]]
+  # normalize rownames to cleaned base IDs
+  rn <- rownames(fo)
+  # case-insensitive match
+  m  <- match(tolower(metadata$SampleID), tolower(rn))
+  keep <- !is.na(m)
+  if (any(keep)) {
+    metadata[[paste0("filtered_reads_", mk)]][keep] <- fo[m[keep], "reads.out"]
+  }
+}
+
+nc_mask <- grepl("nc$", metadata$SampleID, ignore.case = TRUE)
+metadata |>
+  dplyr::filter(nc_mask) |>
+  dplyr::select(SampleID, raw_reads_f,
+                trimmed_reads_16S, trimmed_reads_ITS2,
+                filtered_reads_16S, filtered_reads_ITS2)
+
+
+# Keep a convenience “any” column for stacked plots
+metadata$filtered_reads_any <- pmax(metadata$filtered_reads_16S, metadata$filtered_reads_ITS2, na.rm = TRUE)
+metadata$filtered_reads_any[!is.finite(metadata$filtered_reads_any)] <- NA_real_
+
+
+metadata$trimmed_reads_any <- pmax(metadata$trimmed_reads_16S,
+                                   metadata$trimmed_reads_ITS2,
+                                   na.rm = TRUE)
+metadata$trimmed_reads_any[!is.finite(metadata$trimmed_reads_any)] <- NA_real_
+
+
+
+##################################################################
+############## Step 6: learn error rates (per marker) ############
+##################################################################
+
+by_marker <- split(files_tbl, files_tbl$marker)
+
+err_F <- list(); err_R <- list()
+for (mk in names(by_marker)) {
+  subdf <- by_marker[[mk]]
+  if (nrow(subdf) == 0) next
+  message("Learning errors for ", mk)
+  err_F[[mk]] <- learnErrors(subdf$filt_F, multithread = TRUE)
+  err_R[[mk]] <- learnErrors(subdf$filt_R, multithread = TRUE)
+  # Optional: save error plots
+  pf <- plotErrors(err_F[[mk]], nominalQ = TRUE) + labs(title = paste("Error F -", mk))
+  pr <- plotErrors(err_R[[mk]], nominalQ = TRUE) + labs(title = paste("Error R -", mk))
+  ggsave(file.path(meta_dir, paste0("error_", mk, "_forward.pdf")), pf, width = 6, height = 5)
+  ggsave(file.path(meta_dir, paste0("error_", mk, "_reverse.pdf")), pr, width = 6, height = 5)
+}
+
+##################################################################
+################ Step 7: denoise (per marker) ####################
+##################################################################
+
+dada_F <- list(); dada_R <- list()
+for (mk in names(by_marker)) {
+  subdf <- by_marker[[mk]]
+  if (nrow(subdf) == 0) next
+  message("Denoising ", mk)
+  dada_F[[mk]] <- dada(subdf$filt_F, err = err_F[[mk]], pool = FALSE, multithread = TRUE)
+  dada_R[[mk]] <- dada(subdf$filt_R, err = err_R[[mk]], pool = FALSE, multithread = TRUE)
+}
+# Denoised counts per marker -> metadata (CASE-INSENSITIVE)
+metadata$denoised_reads_16S  <- NA_real_
+metadata$denoised_reads_ITS2 <- NA_real_
+
+for (mk in names(dada_F)) {
+  df_cnt <- sapply(dada_F[[mk]], function(x) sum(getUniques(x)))
+  dr_cnt <- sapply(dada_R[[mk]], function(x) sum(getUniques(x)))
+  names(df_cnt) <- clean_base(names(df_cnt))
+  names(dr_cnt) <- clean_base(names(dr_cnt))
+  
+  mF <- ci_match(metadata$SampleID, names(df_cnt))
+  mR <- ci_match(metadata$SampleID, names(dr_cnt))
+  
+  denoised <- pmin(
+    ifelse(is.na(mF), NA_real_, df_cnt[mF]),
+    ifelse(is.na(mR), NA_real_, dr_cnt[mR]),
+    na.rm = TRUE
+  )
+  denoised[!is.finite(denoised)] <- NA_real_
+  metadata[[paste0("denoised_reads_", mk)]] <- denoised
+}
+metadata$denoised_reads_any <- pmax(metadata$denoised_reads_16S, metadata$denoised_reads_ITS2, na.rm = TRUE)
+metadata$denoised_reads_any[!is.finite(metadata$denoised_reads_any)] <- NA_real_
+
+
+##################################################################
+############ Step 9: merge pairs (per marker) ####################
+##################################################################
+
+merged_list <- list()
+metadata$merged_reads_16S  <- NA_real_
+metadata$merged_reads_ITS2 <- NA_real_
+
+for (mk in names(by_marker)) {
+  subdf <- by_marker[[mk]]
+  if (nrow(subdf) == 0) next
+  message("Merging ", mk)
+  
+  merged_list[[mk]] <- mergePairs(
+    dada_F[[mk]], subdf$filt_F,
+    dada_R[[mk]], subdf$filt_R,
+    minOverlap = 10, maxMismatch = 2,
+    trimOverhang = TRUE, verbose = TRUE
+  )
+  
+  # counts named by file base (cleaned)
+  m_cnt <- sapply(merged_list[[mk]], function(x) sum(getUniques(x)))
+  names(m_cnt) <- clean_base(names(m_cnt))
+  
+  # CASE-INSENSITIVE mapping back to metadata
+  m    <- ci_match(metadata$SampleID, names(m_cnt))   # <- match(tolower(...))
+  keep <- !is.na(m)
+  if (any(keep)) {
+    metadata[[paste0("merged_reads_", mk)]][keep] <- m_cnt[m[keep]]
+  }
+}
+
+metadata$merged_reads_any <- pmax(metadata$merged_reads_16S, metadata$merged_reads_ITS2, na.rm = TRUE)
+metadata$merged_reads_any[!is.finite(metadata$merged_reads_any)] <- NA_real_
+
+
+##################################################################
+########## Quick stacked plots (any marker columns) ##############
+##################################################################
+
+meta_seq <- metadata %>% filter(!is.na(raw_reads_f))
+max_y    <- max(meta_seq$raw_reads_f, na.rm = TRUE)
+
+p_any <- ggplot(meta_seq, aes(x = reorder(SampleID, raw_reads_f))) +
+  geom_bar(aes(y = raw_reads_f,        fill = "raw_reads"),      stat = "identity", width = 0.7) +
+  geom_bar(aes(y = filtered_reads_any, fill = "filtered_reads"), stat = "identity", width = 0.7) +
+  geom_bar(aes(y = denoised_reads_any, fill = "denoised_reads"), stat = "identity", width = 0.7) +
+  geom_bar(aes(y = merged_reads_any,   fill = "merged_reads"),   stat = "identity", width = 0.7) +
+  scale_fill_manual(values = c(raw_reads      = "#BBC6C8",
+                               filtered_reads = "#DDBEAA",
+                               denoised_reads = "#806491",
+                               merged_reads   = "#2F70AF"),
+                    breaks = c("raw_reads","filtered_reads","denoised_reads","merged_reads"),
+                    labels = c("Raw","Filtered (any)","Denoised (any)","Merged (any)")) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, .2))) +
+  coord_flip() +
+  labs(title = "Read counts across steps (any marker)",
+       x = "Sample ID", y = "Number of reads", fill = "") +
+  theme_minimal() +
+  theme(legend.position = "top", panel.grid.major.y = element_blank())
+
+ggsave(file.path(meta_dir, "stacked_any_raw_filtered_denoised_merged.png"),
+       plot = p_any, width = 8, height = 6, bg = "white", dpi = 300)
+
+##################################################################
+####### (Optional) per-marker stacked plots for diagnostics #######
+##################################################################
+
+plot_step_stack_marker <- function(mk, col) {
+  cols <- list(
+    raw = "#BBC6C8", filt = "#DDBEAA", den = "#806491", mer = col
+  )
+  df <- metadata %>%
+    mutate(
+      filtered = .data[[paste0("filtered_reads_", mk)]],
+      denoised = .data[[paste0("denoised_reads_", mk)]],
+      merged   = .data[[paste0("merged_reads_", mk)]]
+    ) %>%
+    filter(!is.na(raw_reads_f) & (!is.na(filtered) | !is.na(denoised) | !is.na(merged)))
+  if (nrow(df) == 0) return(invisible(NULL))
+  g <- ggplot(df, aes(x = reorder(SampleID, raw_reads_f))) +
+    geom_bar(aes(y = raw_reads_f, fill = "raw"), stat = "identity", width = .7) +
+    geom_bar(aes(y = filtered,    fill = "filt"), stat = "identity", width = .7) +
+    geom_bar(aes(y = denoised,    fill = "den"),  stat = "identity", width = .7) +
+    geom_bar(aes(y = merged,      fill = "mer"),  stat = "identity", width = .7) +
+    scale_fill_manual(values = c(raw = cols$raw, filt = cols$filt, den = cols$den, mer = cols$mer),
+                      breaks = c("raw","filt","den","mer"),
+                      labels = c("Raw", "Filtered", "Denoised", "Merged")) +
+    scale_y_continuous(labels = comma, expand = expansion(mult = c(0, .2))) +
+    coord_flip() +
+    labs(title = paste0("Read counts (", mk, ")"), x = "Sample ID", y = "Reads", fill = "") +
+    theme_minimal() + theme(legend.position = "top", panel.grid.major.y = element_blank())
+  ggsave(file.path(meta_dir, paste0("stacked_", mk, "_raw_filt_den_mer.png")),
+         plot = g, width = 8, height = 6, bg = "white", dpi = 300)
+}
+
+plot_step_stack_marker("16S",  "#1b9e77")
+plot_step_stack_marker("ITS2", "#7570b3")
+
+
+############################################################################
+################  Step 11: construct count tables (per marker) ############
+############################################################################
+
+count_table_16S  <- if ("16S"  %in% names(merged_list)) makeSequenceTable(merged_list[["16S"]])  else NULL
+count_table_ITS2 <- if ("ITS2" %in% names(merged_list)) makeSequenceTable(merged_list[["ITS2"]]) else NULL
+
+############################################################################
+################# Step 12: remove chimeras (per marker) ###################
+############################################################################
+
+nochim_16S  <- if (!is.null(count_table_16S))  removeBimeraDenovo(count_table_16S,  method = "consensus", multithread = TRUE, verbose = TRUE)  else NULL
+nochim_ITS2 <- if (!is.null(count_table_ITS2)) removeBimeraDenovo(count_table_ITS2, method = "consensus", multithread = TRUE, verbose = TRUE) else NULL
+
+############################################################################
+################ Step 13: map non-chimera counts back #####################
+############################################################################
+
+# Per-marker non-chimera reads (CASE-INSENSITIVE)
+metadata$nonchimera_reads_16S  <- NA_real_
+metadata$nonchimera_reads_ITS2 <- NA_real_
+
+if (!is.null(nochim_16S)) {
+  nc16 <- rowSums(nochim_16S); names(nc16) <- clean_base(names(nc16))
+  m16  <- ci_match(metadata$SampleID, names(nc16))
+  keep <- !is.na(m16)
+  metadata$nonchimera_reads_16S[keep] <- nc16[m16[keep]]
+}
+if (!is.null(nochim_ITS2)) {
+  nc2 <- rowSums(nochim_ITS2); names(nc2) <- clean_base(names(nc2))
+  m2  <- ci_match(metadata$SampleID, names(nc2))
+  keep <- !is.na(m2)
+  metadata$nonchimera_reads_ITS2[keep] <- nc2[m2[keep]]
+}
+
+metadata$nonchimera_reads_any <- pmax(metadata$nonchimera_reads_16S,
+                                      metadata$nonchimera_reads_ITS2, na.rm = TRUE)
+metadata$nonchimera_reads_any[!is.finite(metadata$nonchimera_reads_any)] <- NA_real_
+
+if (any(is.na(m))) message("Unmatched in ", mk, ": ",
+                           paste(head(metadata$SampleID[is.na(m)], 10), collapse=", "))
+
+
+
+# Per-marker full stack to NON-CHIMERA (Raw ▸ … ▸ Non-chimera)
+plot_nonchimera_marker <- function(mk, trim_color, merge_color = "#EBADE6", pos_frac = 0.5) {
+  cols <- list(raw="#9faeb1", trim="#BBC6C8", filt="#DDBEAA", den="#806491", mer=merge_color, nch=trim_color)
+  
+  df <- metadata %>%
+    dplyr::mutate(
+      trimmed    = .data[[paste0("trimmed_reads_",    mk)]],
+      filtered   = .data[[paste0("filtered_reads_",   mk)]],
+      denoised   = .data[[paste0("denoised_reads_",   mk)]],
+      merged     = .data[[paste0("merged_reads_",     mk)]],
+      nonchimera = .data[[paste0("nonchimera_reads_", mk)]]
+    ) %>%
+    dplyr::filter(
+      !is.na(raw_reads_f) &
+        (!is.na(trimmed) | !is.na(filtered) | !is.na(denoised) | !is.na(merged) | !is.na(nonchimera))
+    ) %>%
+    dplyr::mutate(
+      pct_nch   = dplyr::if_else(raw_reads_f > 0 & !is.na(nonchimera),
+                                 100 * nonchimera / raw_reads_f, NA_real_),
+      pct_label = dplyr::if_else(!is.na(pct_nch), sprintf("%.1f%%", pct_nch), NA_character_),
+      # Bars are overlaid (not stacked), so put the label at a fraction of the nonchimera height
+      label_y   = dplyr::if_else(!is.na(nonchimera) & nonchimera > 0,
+                                 pmax(1, nonchimera * pos_frac),  # pmax avoids y=0 clipping
+                                 NA_real_)
+    )
+  
+  if (nrow(df) == 0) return(invisible(NULL))
+  
+  g <- ggplot2::ggplot(df, ggplot2::aes(x = reorder(SampleID, nonchimera))) +
+    ggplot2::geom_bar(ggplot2::aes(y = raw_reads_f, fill = "raw"),  stat = "identity", width = .7) +
+    ggplot2::geom_bar(ggplot2::aes(y = trimmed,     fill = "trim"), stat = "identity", width = .7) +
+    ggplot2::geom_bar(ggplot2::aes(y = filtered,    fill = "filt"), stat = "identity", width = .7) +
+    ggplot2::geom_bar(ggplot2::aes(y = denoised,    fill = "den"),  stat = "identity", width = .7) +
+    ggplot2::geom_bar(ggplot2::aes(y = merged,      fill = "mer"),  stat = "identity", width = .7) +
+    ggplot2::geom_bar(ggplot2::aes(y = nonchimera,  fill = "nch"),  stat = "identity", width = .7) +
+    ggplot2::geom_text(
+      data = dplyr::filter(df, !is.na(pct_label) & !is.na(label_y)),
+      ggplot2::aes(y = label_y, label = pct_label),
+      color = "white", size = 3, fontface = "bold", na.rm = TRUE
+    ) +
+    ggplot2::scale_fill_manual(
+      values = c(raw=cols$raw, trim=cols$trim, filt=cols$filt, den=cols$den, mer=cols$mer, nch=cols$nch),
+      breaks = c("nch","mer","den","filt","trim","raw"),
+      labels = c("Non-chimera","Merged","Denoised","Filtered","Trimmed","Raw")
+    ) +
+    ggplot2::guides(fill = ggplot2::guide_legend(nrow = 1, byrow = TRUE)) +
+    ggplot2::scale_y_continuous(labels = scales::comma,
+                                expand = ggplot2::expansion(mult = c(0, .2))) +
+    ggplot2::coord_flip() +
+    ggplot2::labs(title = NULL, x = "Sample ID", y = "Reads", fill = "") +
+    ggplot2::theme_minimal() +
+    ggplot2::theme(
+      legend.position = "bottom",
+      legend.direction = "horizontal",
+      legend.box = "horizontal",
+      panel.grid.major.y = ggplot2::element_blank()
+    )
+  
+  print(g)
+  ggplot2::ggsave(file.path(meta_dir, paste0("stacked_", mk, "_raw_trim_filt_den_mer_nonchimera.png")),
+                  plot = g, width = 8, height = 6, bg = "white", dpi = 300)
+}
+
+
+# Calls (pass the trim color per marker)
+plot_nonchimera_marker("16S",  "#1b9e77")
+plot_nonchimera_marker("ITS2", "#7570b3")
+
+
+
+
+############################################################################
+###........................ NC DIAGNOSTICS ..............................###
+############################################################################
+
+# identify NCs (adjust pattern if yours differ)
+nc_ids <- metadata$SampleID[grepl("nc$", metadata$SampleID, ignore.case = TRUE)]
+
+metadata %>%
+  dplyr::filter(SampleID %in% nc_ids) %>%
+  dplyr::select(SampleID, raw_reads_f,
+                trimmed_reads_16S, trimmed_reads_ITS2,
+                filtered_reads_16S, filtered_reads_ITS2) %>%
+  print(n=100)
+
+## --- Looser filter just for NC diagnostics ---
+library(dplyr)
+
+# Detect NCs in your trimmed files
+trim_R1_nc <- list.files(trim_dir, pattern = "nc-(16S|ITS2?)_R1_001\\.fastq\\.gz$", 
+                         full.names = TRUE, ignore.case = TRUE)
+trim_R2_nc <- sub("_R1_", "_R2_", trim_R1_nc)
+
+nc_tbl <- tibble(
+  trim_F = trim_R1_nc,
+  trim_R = trim_R2_nc
+) %>%
+  mutate(
+    marker = ifelse(grepl("ITS2?", trim_F, ignore.case = TRUE), "ITS2", "16S"),
+    base   = basename(trim_F) %>%
+      sub("_R1_001\\.fastq\\.gz$", "", .) %>%
+      sub("-(16S|ITS2?)$", "", .),
+    filt_F = file.path(filt_dir, paste0("NCdiag_", basename(trim_F))),
+    filt_R = file.path(filt_dir, paste0("NCdiag_", basename(trim_R)))
+  )
+
+# Looser filtering parameters
+loose_params <- list(
+  "16S"  = list(truncLen = c(200, 180), maxEE = c(4,4), minLen = 80),
+  "ITS2" = list(truncLen = c(220, 160), maxEE = c(5,5), minLen = 60)
+)
+
+# Run filterAndTrim() for each marker
+filtered_nc_list <- list()
+for (mk in unique(nc_tbl$marker)) {
+  subdf <- nc_tbl %>% filter(marker == mk)
+  if (nrow(subdf) == 0) next
+  p <- loose_params[[mk]]
+  message("Loose filtering NCs for ", mk)
+  filtered_nc_list[[mk]] <- filterAndTrim(
+    fwd = subdf$trim_F, filt = subdf$filt_F,
+    rev = subdf$trim_R, filt.rev = subdf$filt_R,
+    trimLeft = c(0,0),
+    truncLen = p$truncLen, maxEE = p$maxEE,
+    truncQ = 2, minLen = p$minLen,
+    maxN = 0, rm.phix = TRUE, compress = TRUE, multithread = TRUE
+  )
+}
+
+# Combine and order by read count
+nc_counts <- bind_rows(
+  lapply(names(filtered_nc_list), function(mk) {
+    df <- as.data.frame(filtered_nc_list[[mk]])
+    df$SampleID <- rownames(df)
+    df$Marker <- mk
+    df
+  })
+) %>%
+  arrange(desc(reads.out))
+
+nc_counts
+readr::write_csv(nc_counts, file.path(meta_dir, "NC_loose_filter_counts.csv"))
+
+
+
+############################################################################
+###  Step 13 – save final outputs (metadata, FASTA, count table)        ###
+############################################################################
+
+## ── Define output folder ───────────────────────────────────────────────
+dir_out <- file.path(base_dir, "4.results")
+dir.create(dir_out, recursive = TRUE, showWarnings = FALSE)
+
+## ── Helper: export chimera-free count table + FASTA for one marker ──────
+export_nochim <- function(mk, seqtab_nochim) {
+  if (is.null(seqtab_nochim) || nrow(seqtab_nochim) == 0 || ncol(seqtab_nochim) == 0) return(invisible(NULL))
+  
+  # Abundance vector (DNA sequences as names)
+  asv_abund <- setNames(as.integer(colSums(seqtab_nochim)), colnames(seqtab_nochim))
+  
+  # Marker-specific ASV IDs
+  asv_ids <- sprintf("%s_ASV_%04d", mk, seq_along(asv_abund))
+  names(asv_ids) <- names(asv_abund)  # names = DNA sequences
+  
+  ## --- FASTA ---
+  dada2::uniquesToFasta(
+    unqs = asv_abund,
+    fout = file.path(dir_out, paste0("asvs_", mk, ".fasta")),
+    ids  = asv_ids[names(asv_abund)]
+  )
+  
+  ## --- Count table ---
+  colnames(seqtab_nochim) <- asv_ids
+  rownames(seqtab_nochim) <- sub("_R[12]_001\\.fastq\\.gz$", "", rownames(seqtab_nochim))
+  
+  out <- seqtab_nochim |>
+    as.data.frame() |>
+    tibble::rownames_to_column(var = "SampleID")
+  
+  write.table(
+    out,
+    file = file.path(dir_out, paste0("count_table_", mk, ".txt")),
+    sep = "\t", quote = FALSE, row.names = FALSE
+  )
+}
+
+## ── Export for each marker ──────────────────────────────────────────────
+export_nochim("16S",  nochim_16S)
+export_nochim("ITS2", nochim_ITS2)
+
